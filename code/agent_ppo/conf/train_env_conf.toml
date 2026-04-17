@@ -46,3 +46,24 @@ monster_speedup = 500
 # 最大步数。单局任务预测步数达到最大步数时，任务结束。可配置范围为1～2000。
 max_step = 1000
 
+[curriculum]
+initial_stage = 1
+metric_window_size = 30
+min_train_episodes_per_stage = 30
+
+[curriculum.stage1_to_stage2]
+avg_survival_rate = 0.35
+max_wall_collision_rate = 0.025
+max_danger_penalty_per_step = 0.015
+
+[curriculum.stage2_to_stage3]
+avg_survival_rate = 0.55
+min_exploration_score = 0.08
+max_idle_penalty_per_step = 0.010
+max_dead_end_penalty_per_step = 0.004
+
+[curriculum.stage3_to_stage4]
+avg_survival_rate = 0.70
+min_treasure_count = 0.80
+min_buff_count = 0.20
+min_treasure_approach_reward = 0.03

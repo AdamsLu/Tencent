@@ -215,39 +215,113 @@ class Preprocessor:
             return default
         return g.get(key, default)
 
+    def set_curriculum_stage(self, stage):
+        """Set current curriculum stage to [1, 4]."""
+        try:
+            stage = int(stage)
+        except Exception:
+            stage = 1
+        self.curriculum_stage = max(1, min(4, stage))
+
+    def get_curriculum_stage(self):
+        return int(getattr(self, "curriculum_stage", 1))
+
+    def get_curriculum_stage_name(self):
+        stage = self.get_curriculum_stage()
+        stage_name_map = {
+            1: "survival_base",
+            2: "explore_and_stabilize",
+            3: "safe_resource_acquisition",
+            4: "full_game_and_skill_refine",
+        }
+        return stage_name_map.get(stage, "unknown")
+
+    def get_reward_term_coef(self, section, key="coef", default=1.0):
+        """Public helper for workflow-side metric normalization."""
+        return float(self._cfg(section, key, default))
+
     def _is_stage_enabled(self, name):
         """Check whether a reward term is enabled in current curriculum stage.
 
-        当前仅实现 stage 1：
-        - survive_reward
-        - monster_dist_shaping
-        - danger_penalty
-        - wall_collision_penalty
-        其余奖励项先关闭，便于先把“活下来”学稳。
+        Stage 1: 生存底座与基础移动
+        Stage 2: 探索建图与脱困稳定化
+        Stage 3: 安全前提下的资源获取
+        Stage 4: 技能时机与综合博弈精修
         """
-        stage = int(getattr(self, "curriculum_stage", 1))
-        if stage == 1:
-            enabled_names = {
+        stage = self.get_curriculum_stage()
+
+        stage_reward_map = {
+            1: {
                 "survive_reward",
                 "monster_dist_shaping",
                 "danger_penalty",
                 "wall_collision_penalty",
-            }
-            return name in enabled_names
-        return True
+            },
+            2: {
+                "survive_reward",
+                "monster_dist_shaping",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "exploration_reward",
+                "centroid_away_reward",
+                "idle_wander_penalty",
+                "dead_end_penalty",
+                "safe_zone_reward",
+            },
+            3: {
+                "survive_reward",
+                "monster_dist_shaping",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "exploration_reward",
+                "centroid_away_reward",
+                "idle_wander_penalty",
+                "dead_end_penalty",
+                "safe_zone_reward",
+                "treasure_reward",
+                "treasure_approach_reward",
+                "speed_buff_reward",
+                "speed_buff_approach_reward",
+                "speed_buff_escape_reward",
+            },
+            4: {
+                "survive_reward",
+                "monster_dist_shaping",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "exploration_reward",
+                "centroid_away_reward",
+                "idle_wander_penalty",
+                "dead_end_penalty",
+                "safe_zone_reward",
+                "treasure_reward",
+                "treasure_approach_reward",
+                "speed_buff_reward",
+                "speed_buff_approach_reward",
+                "speed_buff_escape_reward",
+                "flash_fail_penalty",
+                "flash_escape_reward",
+                "flash_survival_reward",
+                "flash_abuse_penalty",
+                "late_survive_reward",
+            },
+        }
+
+        enabled_names = stage_reward_map.get(stage, stage_reward_map[1])
+        return name in enabled_names
 
     def _is_survival_only_stage(self):
-        """Return whether current curriculum is survival-only stage.
+        """Return whether current curriculum should suppress resource guidance.
 
-        当前严格 stage 1 只训练：
-        - 生存奖励
-        - 怪物距离 shaping
-        - 危险惩罚
-        - 撞墙惩罚
+        Stage 1 / 2:
+        - 关闭宝箱 / buff 导向偏置
+        - 关闭资源靠近型动作收益特征
+        - 让模型先把“生存 + 探索 + 脱困”学稳
 
-        该方法用于在特征构造和动作筛选阶段，关闭宝箱 / buff 导向偏置。
+        Stage 3 / 4:
+        - 开启资源相关观测与动作引导
         """
-        return int(getattr(self, "curriculum_stage", 1)) == 1
+        return self.get_curriculum_stage() <= 2
 
     def reset(self):
         """Reset per-episode state for reward computation.
@@ -338,8 +412,9 @@ class Preprocessor:
         self.last_reward_info = {}
 
         # ========== 课程训练阶段控制 ==========
-        # 当前先只启用 stage 1：生存、危险规避、撞墙规避
-        self.curriculum_stage = 1
+        # 保留外部 workflow 设置的 stage，不在每局 reset 时回退到 1
+        prev_stage = int(getattr(self, "curriculum_stage", 1))
+        self.curriculum_stage = max(1, min(4, prev_stage))
 
         # ========== 高层探索事件记忆 ==========
         # 首次发现宝箱区域、首次进入新连通区域、首次进入远离历史轨迹区域
