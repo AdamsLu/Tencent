@@ -30,28 +30,6 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 18. 死角/死路惩罚（进入后每步惩罚，远离后重置）
 """
 
-# ============================= 代码结构说明 =============================
-# 1. 基础配置与状态管理
-#    - _default_reward_config / _load_reward_config / reset
-# 2. 地图与几何辅助
-#    - _is_half_surrounded_dead_end / _update_explored_map / _count_free_neighbors
-# 3. 目标与方向特征
-#    - _compute_nearest_organ_distance / _collect_organ_slots / 方向one-hot编码
-# 4. 动作后果建模（候选动作特征）
-#    - _simulate_next_position / _build_candidate_action_features
-#    - _build_action_risk_benefit_features
-# 5. 探索事件建模
-#    - _region_id_from_pos / _get_local_connected_region_anchor / _compute_exploration_events
-# 6. 动作掩码分层
-#    - _preprocess_move_action_mask 负责硬合法性
-#    - action_risk_benefit_feat 负责软风险/收益指数
-# 7. 课程训练奖励
-#    - _is_stage_enabled 控制当前阶段启用的奖励项
-#    - _compute_rewards 统一结算即时奖励
-# 8. 主入口
-#    - feature_process: 生成 feature / legal_action / reward
-# =====================================================================
-
 import os
 import copy
 from collections import deque
@@ -215,40 +193,6 @@ class Preprocessor:
             return default
         return g.get(key, default)
 
-    def _is_stage_enabled(self, name):
-        """Check whether a reward term is enabled in current curriculum stage.
-
-        当前仅实现 stage 1：
-        - survive_reward
-        - monster_dist_shaping
-        - danger_penalty
-        - wall_collision_penalty
-        其余奖励项先关闭，便于先把“活下来”学稳。
-        """
-        stage = int(getattr(self, "curriculum_stage", 1))
-        if stage == 1:
-            enabled_names = {
-                "survive_reward",
-                "monster_dist_shaping",
-                "danger_penalty",
-                "wall_collision_penalty",
-            }
-            return name in enabled_names
-        return True
-
-    def _is_survival_only_stage(self):
-        """Return whether current curriculum is survival-only stage.
-
-        当前严格 stage 1 只训练：
-        - 生存奖励
-        - 怪物距离 shaping
-        - 危险惩罚
-        - 撞墙惩罚
-
-        该方法用于在特征构造和动作筛选阶段，关闭宝箱 / buff 导向偏置。
-        """
-        return int(getattr(self, "curriculum_stage", 1)) == 1
-
     def reset(self):
         """Reset per-episode state for reward computation.
 
@@ -336,16 +280,6 @@ class Preprocessor:
 
         # 存储最新的reward_info供agent获取
         self.last_reward_info = {}
-
-        # ========== 课程训练阶段控制 ==========
-        # 当前先只启用 stage 1：生存、危险规避、撞墙规避
-        self.curriculum_stage = 1
-
-        # ========== 高层探索事件记忆 ==========
-        # 首次发现宝箱区域、首次进入新连通区域、首次进入远离历史轨迹区域
-        self.discovered_treasure_regions = set()
-        self.visited_region_anchors = set()
-        self.visited_far_trajectory_regions = set()
 
     def _is_half_surrounded_dead_end(self, map_info):
         """Detect dead-end by ray probing + boundary tracing + compactness.
@@ -865,7 +799,7 @@ class Preprocessor:
             # 5) 下一位置是否更接近宝箱
             next_treasure_dist_norm, _, found_treasure = self._compute_nearest_organ_distance(organs, next_pos, 1)
             next_closer_to_treasure = 0.0
-            if (not self._is_survival_only_stage()) and found_treasure and next_treasure_dist_norm < cur_treasure_dist_norm:
+            if found_treasure and next_treasure_dist_norm < cur_treasure_dist_norm:
                 next_closer_to_treasure = 1.0
 
             # 6) 下一位置周围开阔度
@@ -890,66 +824,6 @@ class Preprocessor:
                     next_openness,
                     next_dead_end_flag,
                 ],
-                dtype=np.float32,
-            )
-
-        return out
-
-    def _build_action_risk_benefit_features(self, hero_pos, monsters, organs, map_info, has_speed_buff, move_mask):
-        """Build soft risk/benefit indices for each move action [0..7].
-
-        输出结构：8 × 4 = 32维
-        [risk_monster, risk_dead_end, benefit_treasure, benefit_openness]
-
-        作用：
-        - move_mask 仍然负责“硬禁用非法动作”
-        - 这个方法负责为剩余合法动作附加软风险/收益指数
-        """
-        feat_per_action = 4
-        out = np.zeros(8 * feat_per_action, dtype=np.float32)
-
-        cur_treasure_dist_norm, _, _ = self._compute_nearest_organ_distance(organs, hero_pos, 1)
-
-        for a in range(8):
-            base = a * feat_per_action
-
-            if move_mask[a] == 0:
-                out[base: base + feat_per_action] = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
-                continue
-
-            next_pos, next_r, next_c = self._simulate_next_position(
-                hero_pos=hero_pos,
-                map_info=map_info,
-                action_idx=a,
-                has_speed_buff=has_speed_buff,
-            )
-
-            next_min_monster_dist_norm = 1.0
-            for m in monsters:
-                pos = m.get("pos", {"x": 0, "z": 0})
-                if pos["x"] == 0 and pos["z"] == 0:
-                    continue
-                dist = np.sqrt(
-                    (float(next_pos["x"]) - float(pos["x"])) ** 2 +
-                    (float(next_pos["z"]) - float(pos["z"])) ** 2
-                )
-                next_min_monster_dist_norm = min(next_min_monster_dist_norm, _norm(dist, MAP_SIZE * 1.41))
-            risk_monster = 1.0 - next_min_monster_dist_norm
-
-            risk_dead_end = 0.0
-            benefit_openness = 0.0
-            if next_r is not None and next_c is not None:
-                local_map = self._extract_local_map_centered(map_info, next_r, next_c, view_size=21)
-                risk_dead_end = 1.0 if self._is_half_surrounded_dead_end(local_map) else 0.0
-                benefit_openness = self._count_free_neighbors(map_info, next_r, next_c, radius=1)
-
-            next_treasure_dist_norm, _, found_treasure = self._compute_nearest_organ_distance(organs, next_pos, 1)
-            benefit_treasure = 0.0
-            if (not self._is_survival_only_stage()) and found_treasure:
-                benefit_treasure = max(0.0, cur_treasure_dist_norm - next_treasure_dist_norm)
-
-            out[base: base + feat_per_action] = np.array(
-                [risk_monster, risk_dead_end, benefit_treasure, benefit_openness],
                 dtype=np.float32,
             )
 
@@ -1214,7 +1088,7 @@ class Preprocessor:
         monster_feats,
         last_action,
         map_info=None,
-        exploration_events=None,
+        new_explored_cells=0,
         terminated=False,
         truncated=False,
     ):
@@ -1230,7 +1104,7 @@ class Preprocessor:
             monster_feats: 怪物特征列表（已处理好的numpy数组列表）
             last_action: 上一帧执行的动作ID
             map_info: 局部地图信息（用于安全区计算）
-            exploration_events: 三类探索事件字典（首次发现宝箱区域/新连通区域/远离历史轨迹区域）
+            new_explored_cells: 本帧新探索的格子数（用于开图奖励）
             terminated: 当前帧是否终局-失败（被抓）
             truncated: 当前帧是否因步数上限终局
 
@@ -1492,37 +1366,16 @@ class Preprocessor:
         if self._cfg("safe_zone_reward", "enable", True) and is_in_safe_zone:
             safe_zone_reward = float(self._cfg("safe_zone_reward", "coef", 0.01))
 
-        # 14.【稀疏】探索事件奖励 —— 将“开图”切换为三类首次事件：
-        #     1) 首次发现宝箱区域
-        #     2) 首次到达新连通区域
-        #     3) 首次进入远离历史轨迹区域
+        # 14.【稀疏】开图奖励 —— 当英雄局部视野覆盖了未探索过的区域时，
+        #     根据新记录的格子数给予较小奖励。出生后前N步不计入（出生保护期）。
         exploration_reward = 0.0
-        exploration_treasure_region_reward = 0.0
-        exploration_connected_region_reward = 0.0
-        exploration_far_traj_reward = 0.0
-
-        if exploration_events is None:
-            exploration_events = {
-                "first_discover_treasure_region": 0.0,
-                "first_arrive_new_connected_region": 0.0,
-                "first_enter_far_trajectory_region": 0.0,
-            }
-
-        if self._cfg("exploration_reward", "enable", True) and self.birth_step_counter >= self.BIRTH_PROTECTION_STEPS:
-            exploration_treasure_region_reward = 0.20 * float(
-                exploration_events.get("first_discover_treasure_region", 0.0)
-            )
-            exploration_connected_region_reward = 0.12 * float(
-                exploration_events.get("first_arrive_new_connected_region", 0.0)
-            )
-            exploration_far_traj_reward = 0.08 * float(
-                exploration_events.get("first_enter_far_trajectory_region", 0.0)
-            )
-            exploration_reward = (
-                exploration_treasure_region_reward
-                + exploration_connected_region_reward
-                + exploration_far_traj_reward
-            )
+        if self._cfg("exploration_reward", "enable", True) and new_explored_cells > 0:
+            # 出生保护：前BIRTH_PROTECTION_STEPS步内不计入开图奖励
+            if self.birth_step_counter >= self.BIRTH_PROTECTION_STEPS:
+                # 下调开图奖励，避免覆盖怪物距离 shaping
+                exploration_reward = float(
+                    self._cfg("exploration_reward", "coef_per_cell", 0.0002)
+                ) * new_explored_cells
 
         # 15.【稠密】轨迹质心远离奖励 —— 记录英雄最近N步坐标，计算质心，
         #     鼓励英雄远离历史轨迹质心（避免原地打转/重复路径）
@@ -1667,41 +1520,6 @@ class Preprocessor:
             if self._cfg("centroid_away_reward", "enable", True):
                 centroid_away_reward = float(self._cfg("centroid_away_reward", "coef", 0.005)) * dist_norm
 
-        # ========== 课程训练阶段控制（当前仅实现Stage 1）==========
-        # Stage 1：只保留生存、危险规避、怪物距离 shaping、撞墙惩罚
-        if not self._is_stage_enabled("treasure_reward"):
-            treasure_reward = 0.0
-        if not self._is_stage_enabled("speed_buff_reward"):
-            speed_buff_reward = 0.0
-        if not self._is_stage_enabled("speed_buff_approach_reward"):
-            speed_buff_approach_reward = 0.0
-        if not self._is_stage_enabled("treasure_approach_reward"):
-            treasure_approach_reward = 0.0
-        if not self._is_stage_enabled("late_survive_reward"):
-            late_survive_reward = 0.0
-        if not self._is_stage_enabled("flash_fail_penalty"):
-            flash_fail_penalty = 0.0
-        if not self._is_stage_enabled("flash_escape_reward"):
-            flash_escape_reward = 0.0
-            flash_survival_reward = 0.0
-        if not self._is_stage_enabled("speed_buff_escape_reward"):
-            speed_buff_escape_reward = 0.0
-        if not self._is_stage_enabled("safe_zone_reward"):
-            safe_zone_reward = 0.0
-        if not self._is_stage_enabled("exploration_reward"):
-            exploration_reward = 0.0
-            exploration_treasure_region_reward = 0.0
-            exploration_connected_region_reward = 0.0
-            exploration_far_traj_reward = 0.0
-        if not self._is_stage_enabled("centroid_away_reward"):
-            centroid_away_reward = 0.0
-        if not self._is_stage_enabled("idle_wander_penalty"):
-            idle_wander_penalty = 0.0
-        if not self._is_stage_enabled("flash_abuse_penalty"):
-            flash_abuse_penalty = 0.0
-        if not self._is_stage_enabled("dead_end_penalty"):
-            dead_end_penalty = 0.0
-
         # ========== 汇总所有奖励分量 ==========
         total_reward = (
             survive_reward +
@@ -1775,10 +1593,6 @@ class Preprocessor:
             "dead_end_penalty": dead_end_penalty,
             "dead_end_active": float(self.dead_end_active),
             "exploration_reward": exploration_reward,
-            "exploration_treasure_region_reward": exploration_treasure_region_reward,
-            "exploration_connected_region_reward": exploration_connected_region_reward,
-            "exploration_far_traj_reward": exploration_far_traj_reward,
-            "curriculum_stage": float(self.curriculum_stage),
             "centroid_away_reward": centroid_away_reward,
             "idle_wander_penalty": idle_wander_penalty,
             "idle_streak_steps": float(self.idle_streak_steps),
@@ -1809,113 +1623,6 @@ class Preprocessor:
         dist_norm, _, _ = self._compute_nearest_organ_distance(organs, hero_pos, 1)
         return dist_norm
 
-    def _region_id_from_pos(self, pos, cell_size=8):
-        """Map a global position to a coarse region id.
-
-        用粗粒度网格对全局空间分桶，便于做“首次到达/首次发现”类稀疏奖励。
-        """
-        gx = int(pos["x"]) // int(cell_size)
-        gz = int(pos["z"]) // int(cell_size)
-        return (gx, gz)
-
-    def _get_local_connected_region_anchor(self, map_info):
-        """Get a coarse anchor for the current local connected component.
-
-        在局部地图上从英雄当前位置做4邻域BFS，
-        返回当前连通区域的粗粒度锚点，用于“首次进入新连通区域”事件。
-        """
-        if map_info is None:
-            return None
-
-        rows = len(map_info)
-        cols = len(map_info[0]) if rows > 0 else 0
-        if rows == 0 or cols == 0:
-            return None
-
-        cr = rows // 2
-        cc = cols // 2
-        if map_info[cr][cc] == 0:
-            return None
-
-        visited = set()
-        q = deque()
-        q.append((cr, cc))
-        visited.add((cr, cc))
-        dirs4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-        while q:
-            r, c = q.popleft()
-            for dr, dc in dirs4:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and map_info[nr][nc] != 0:
-                    if (nr, nc) not in visited:
-                        visited.add((nr, nc))
-                        q.append((nr, nc))
-
-        if not visited:
-            return None
-
-        rs = [p[0] for p in visited]
-        cs = [p[1] for p in visited]
-        anchor_r = (min(rs) + max(rs)) // 2
-        anchor_c = (min(cs) + max(cs)) // 2
-        return (int(anchor_r // 2), int(anchor_c // 2))
-
-    def _compute_exploration_events(self, hero_pos, organs, map_info):
-        """Compute sparse exploration events.
-
-        事件定义：
-        1) 首次发现宝箱区域
-        2) 首次进入新的局部连通区域
-        3) 首次进入远离历史轨迹质心的区域
-        """
-        events = {
-            "first_discover_treasure_region": 0.0,
-            "first_arrive_new_connected_region": 0.0,
-            "first_enter_far_trajectory_region": 0.0,
-        }
-
-        # 1) 首次发现宝箱区域：只对当前附近/视野内的宝箱做首次区域奖励
-        for organ in organs:
-            if organ.get("sub_type") != 1 or int(organ.get("status", 0)) != 1:
-                continue
-            pos = organ.get("pos", None)
-            if pos is None:
-                continue
-            dist = np.sqrt(
-                (float(hero_pos["x"]) - float(pos["x"])) ** 2 +
-                (float(hero_pos["z"]) - float(pos["z"])) ** 2
-            )
-            if dist <= 12.0:
-                rid = self._region_id_from_pos(pos, cell_size=8)
-                if rid not in self.discovered_treasure_regions:
-                    self.discovered_treasure_regions.add(rid)
-                    events["first_discover_treasure_region"] = 1.0
-                    break
-
-        # 2) 首次进入新的局部连通区域
-        region_anchor = self._get_local_connected_region_anchor(map_info)
-        if region_anchor is not None and region_anchor not in self.visited_region_anchors:
-            self.visited_region_anchors.add(region_anchor)
-            events["first_arrive_new_connected_region"] = 1.0
-
-        # 3) 首次进入远离历史轨迹区域
-        if len(self.trajectory_buffer) >= 5:
-            coords = np.array(self.trajectory_buffer, dtype=np.float32)
-            centroid = np.mean(coords, axis=0)
-            dist_to_centroid = float(np.sqrt(
-                (float(hero_pos["x"]) - centroid[0]) ** 2 +
-                (float(hero_pos["z"]) - centroid[1]) ** 2
-            ))
-            far_threshold = 8.0
-            if dist_to_centroid >= far_threshold:
-                rid = self._region_id_from_pos(hero_pos, cell_size=8)
-                if rid not in self.visited_far_trajectory_regions:
-                    self.visited_far_trajectory_regions.add(rid)
-                    events["first_enter_far_trajectory_region"] = 1.0
-
-        return events
-
     def _update_explored_map(self, hero_pos, map_info):
         """Update global explored map with current local FOV.
 
@@ -1931,7 +1638,7 @@ class Preprocessor:
             map_info: 局部地图信息（21×21栅格），1=可通行，0=障碍物
 
         Returns:
-            new_cells_count (int): 本帧新增的已观测格子数（当前仅用于地图记忆，不再直接用于奖励）
+            new_cells_count (int): 本帧新增的已探索格子数
         """
         if map_info is None:
             return 0
@@ -2012,12 +1719,6 @@ class Preprocessor:
             slot_num=2,
         )
 
-        # Stage 1 仅训练生存 / 避险 / 避撞墙，
-        # 因此这里显式屏蔽 treasure / buff 相关槽位，避免策略网络被资源导向信息牵引。
-        if self._is_survival_only_stage():
-            treasure_slots = [np.full(13, -1.0, dtype=np.float32) for _ in range(10)]
-            speed_buff_slots = [np.full(13, -1.0, dtype=np.float32) for _ in range(2)]
-
         # Monster features (14D x 2) / 怪物特征（每个怪物独立槽位，不足补-1）
         #    结构：is_in_view + x + z + speed + dist + 9维相对方向one-hot
         monsters = frame_state.get("monsters", [])
@@ -2081,56 +1782,53 @@ class Preprocessor:
         for i in range(8):
             legal_action[i] = 1 if (legal_action[i] and move_mask[i]) else 0
 
-        # 保存应用 move_mask 之后的合法动作，供后续兜底使用。
+        # 一致性保护：若环境原始合法动作中存在可移动方向，
+        # 但预处理把0-7全部清零，则回退到环境的移动合法性，避免误判导致贴墙抖动。
+        raw_move_legal_cnt = sum(raw_legal_action[:8])
+        masked_move_legal_cnt = sum(legal_action[:8])
+        if raw_move_legal_cnt > 0 and masked_move_legal_cnt == 0:
+            for i in range(8):
+                legal_action[i] = int(raw_legal_action[i])
+
         legal_after_move_mask = legal_action.copy()
 
-        # 资源直达优先（宝箱 / buff）只在后续阶段启用。
-        # Stage 1 明确关闭该逻辑，避免“只学活下来”阶段被资源动作偏置干扰。
-        if not self._is_survival_only_stage():
-            # 在已有合法mask上做宝箱检测：
-            # 1) 若动作在一步内可摸到宝箱，则其视为“可执行吃宝箱动作”。
-            # 2) 加速状态下，若第1步就能摸到宝箱，则该方向强制合法（即使第2步撞墙）。
-            # 3) 若存在“可执行吃宝箱动作”，则0-7只保留这些动作。
-            move_step = int(self._global_cfg("buff_move_step", 2)) if has_speed_buff else int(
-                self._global_cfg("normal_move_step", 1)
+        # 在已有合法mask上做宝箱检测：
+        # 1) 若动作在一步内可摸到宝箱，则其视为“可执行吃宝箱动作”。
+        # 2) 加速状态下，若第1步就能摸到宝箱，则该方向强制合法（即使第2步撞墙）。
+        # 3) 若存在“可执行吃宝箱动作”，则0-7只保留这些动作。
+        move_step = int(self._global_cfg("buff_move_step", 2)) if has_speed_buff else int(
+            self._global_cfg("normal_move_step", 1)
+        )
+        treasure_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=1)
+        speed_buff_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=2)
+        enable_speed_buff_mask = not has_speed_buff
+
+        if has_speed_buff:
+            for i in range(8):
+                if treasure_touch_steps[i] == 1:
+                    legal_action[i] = 1
+
+        direct_touch_legal = [
+            i
+            for i in range(8)
+            if (
+                treasure_touch_steps[i] > 0
+                or (enable_speed_buff_mask and speed_buff_touch_steps[i] > 0)
             )
-            treasure_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=1)
-            speed_buff_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=2)
-            enable_speed_buff_mask = not has_speed_buff
-
-            if has_speed_buff:
-                for i in range(8):
-                    if treasure_touch_steps[i] == 1:
-                        legal_action[i] = 1
-
-            direct_touch_legal = [
-                i
-                for i in range(8)
-                if (
-                    treasure_touch_steps[i] > 0
-                    or (enable_speed_buff_mask and speed_buff_touch_steps[i] > 0)
-                )
-                and legal_action[i] == 1
-            ]
-            if direct_touch_legal:
-                for i in range(8):
-                    legal_action[i] = 1 if i in direct_touch_legal else 0
+            and legal_action[i] == 1
+        ]
+        if direct_touch_legal:
+            for i in range(8):
+                legal_action[i] = 1 if i in direct_touch_legal else 0
 
         if sum(legal_action) == 0:
-            # 分层mask回退策略（严格模式）：
-            # 1) 优先保留经过 move_mask 过滤后的合法移动；
-            # 2) 若 0-7 全部不可走，则只放开环境原始合法的非移动动作（如闪现）；
-            # 3) 只有在所有动作都被清空时，才退回环境原始合法动作作为最终兜底。
-            if sum(legal_after_move_mask[:8]) > 0:
+            # 方向候选筛选过严时，回退到筛选前的合法掩码，避免放开全部非法动作。
+            if sum(legal_after_move_mask) > 0:
                 legal_action = legal_after_move_mask
-            elif sum(raw_legal_action[8:]) > 0:
-                legal_action = [0] * 16
-                for i in range(8, 16):
-                    legal_action[i] = int(raw_legal_action[i])
             elif sum(raw_legal_action) > 0:
-                legal_action = [int(x) for x in raw_legal_action]
+                legal_action = raw_legal_action
             else:
-                legal_action = [0] * 16
+                legal_action = [1] * 16
 
         # Progress features (2D) / 进度特征
         step_norm = _norm(self.step_no, self.max_step)
@@ -2145,16 +1843,6 @@ class Preprocessor:
             organs=organs,
             map_info=map_info,
             has_speed_buff=has_speed_buff,
-        )
-
-        # Layered mask features (8 x 4 = 32D) / 分层mask软风险-收益特征
-        action_risk_benefit_feat = self._build_action_risk_benefit_features(
-            hero_pos=hero_pos,
-            monsters=monsters,
-            organs=organs,
-            map_info=map_info,
-            has_speed_buff=has_speed_buff,
-            move_mask=move_mask,
         )
 
         # Concatenate features / 拼接特征
@@ -2178,25 +1866,17 @@ class Preprocessor:
                 map_feat,
                 progress_feat,
                 candidate_action_feat,
-                action_risk_benefit_feat,
             ]
         )
 
-        # ====== 地图记忆：更新全局探索图 ======
-        _ = self._update_explored_map(hero_pos, map_info)
-
-        # ====== 高层探索事件 ======
-        exploration_events = self._compute_exploration_events(
-            hero_pos=hero_pos,
-            organs=organs,
-            map_info=map_info,
-        )
+        # ====== 地图记忆：更新全局探索图并计算开图数据 ======
+        new_explored_cells = self._update_explored_map(hero_pos, map_info)
 
         # ====== 计算完整奖励（调用新的多分量奖励函数）======
         reward, reward_info = self._compute_rewards(
             frame_state, env_info, hero_pos, monster_feats, last_action,
             map_info=map_info,
-            exploration_events=exploration_events,
+            new_explored_cells=new_explored_cells,
             terminated=terminated,
             truncated=truncated,
         )

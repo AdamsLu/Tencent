@@ -10,7 +10,7 @@ PPO algorithm implementation for Gorge Chase PPO.
 峡谷追猎 PPO 算法实现。
 
 损失组成：
-  total_loss = vf_coef * value_loss + policy_loss - beta * entropy_loss
+    total_loss = vf_coef * value_loss + policy_loss - beta * entropy_loss
 
   - value_loss  : Clipped value function loss（裁剪价值函数损失）
   - policy_loss : PPO Clipped surrogate objective（PPO 裁剪替代目标）
@@ -41,7 +41,6 @@ class Algorithm:
 
         self.last_report_monitor_time = 0
         self.train_step = 0
-        self.stage=0
 
     def learn(self, list_sample_data):
         """Training entry: PPO update on a batch of SampleData.
@@ -86,13 +85,21 @@ class Algorithm:
                 "value_loss": round(info_list[0].item(), 4),
                 "policy_loss": round(info_list[1].item(), 4),
                 "entropy_loss": round(info_list[2].item(), 4),
+                "explained_variance": round(info_list[3].item(), 6),
+                "clip_count": round(info_list[4].item(), 4),
+                "clip_rate": round(info_list[5].item(), 6),
+                "clip_abs_overflow": round(info_list[6].item(), 6),
                 "reward": round(reward.mean().item(), 4),
             }
             self.logger.info(
                 f"[train] total_loss:{results['total_loss']} "
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
-                f"entropy:{results['entropy_loss']}"
+                f"entropy:{results['entropy_loss']} "
+                f"explained_variance:{results['explained_variance']} "
+                f"clip_count:{results['clip_count']} "
+                f"clip_rate:{results['clip_rate']} "
+                f"clip_abs_overflow:{results['clip_abs_overflow']}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
@@ -122,10 +129,19 @@ class Algorithm:
         new_prob = (one_hot * prob_dist).sum(1, keepdim=True)
         old_action_prob = (one_hot * old_prob).sum(1, keepdim=True).clamp(1e-9)
         ratio = new_prob / old_action_prob
+        clip_low = 1.0 - self.clip_param
+        clip_high = 1.0 + self.clip_param
         adv = advantage.view(-1, 1)
         policy_loss1 = -ratio * adv
-        policy_loss2 = -ratio.clamp(1 - self.clip_param, 1 + self.clip_param) * adv
+        clipped_ratio = ratio.clamp(clip_low, clip_high)
+        policy_loss2 = -clipped_ratio * adv
         policy_loss = torch.maximum(policy_loss1, policy_loss2).mean()
+
+        # Clip monitor stats / 裁剪监控统计
+        clipped_mask = (ratio < clip_low) | (ratio > clip_high)
+        clip_count = clipped_mask.float().sum()
+        clip_rate = clipped_mask.float().mean()
+        clip_abs_overflow = torch.abs(ratio - clipped_ratio).mean()
 
         # Value loss (Clipped) / 价值损失
         vp = value_pred
@@ -143,10 +159,30 @@ class Algorithm:
         # Entropy loss / 熵损失
         entropy_loss = (-prob_dist * torch.log(prob_dist.clamp(1e-9, 1))).sum(1).mean()
 
+        explained_variance = self._compute_explained_variance(value_pred, reward_sum)
+
         # Total loss / 总损失
         total_loss = self.vf_coef * value_loss + policy_loss - self.var_beta * entropy_loss
 
-        return total_loss, [value_loss, policy_loss, entropy_loss]
+        return total_loss, [
+            value_loss,
+            policy_loss,
+            entropy_loss,
+            explained_variance,
+            clip_count,
+            clip_rate,
+            clip_abs_overflow,
+        ]
+
+    def _compute_explained_variance(self, value_pred, target):
+        """Compute explained variance between predicted value and target return."""
+        y = target.detach().view(-1)
+        y_pred = value_pred.detach().view(-1)
+        y_var = torch.var(y, unbiased=False)
+        if float(y_var.item()) <= 1e-12:
+            return torch.zeros(1, device=y.device, dtype=y.dtype).squeeze(0)
+        ev = 1.0 - torch.var(y - y_pred, unbiased=False) / y_var
+        return torch.clamp(ev, -1.0, 1.0)
 
     def _masked_softmax(self, logits, legal_action):
         """Softmax with legal action masking (suppress illegal actions).

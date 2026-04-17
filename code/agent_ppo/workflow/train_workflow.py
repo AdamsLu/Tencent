@@ -8,10 +8,20 @@ Author: Tencent AI Arena Authors
 
 Training workflow for Gorge Chase PPO.
 峡谷追猎 PPO 训练工作流。
+
+训练流程：
+1. 正式PPO训练阶段
+   - 训练/评估方案（AGENTS规则）：
+     - 10张地图：7张训练 [1-7]，3张评估 [8-10]
+     - 每10局训练加入1局评估
+     - 训练局：从train_maps随机抽取
+     - 评估局：从eval_maps随机抽取
 """
 
+import copy
 import os
 import time
+import random
 
 import numpy as np
 from agent_ppo.feature.definition import SampleData, sample_process
@@ -25,12 +35,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     env = envs[0]
     agent = agents[0]
 
-    # Read user config / 读取用户配置
     usr_conf = read_usr_conf("agent_ppo/conf/train_env_conf.toml", logger)
     if usr_conf is None:
         logger.error("usr_conf is None, please check agent_ppo/conf/train_env_conf.toml")
         return
 
+    # ========== Formal PPO Training / 正式PPO训练阶段 ==========
     episode_runner = EpisodeRunner(
         env=env,
         agent=agent,
@@ -51,6 +61,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
 
 class EpisodeRunner:
+    """Episode runner for formal PPO training with train/eval alternation.
+    """
+
     def __init__(self, env, agent, usr_conf, logger, monitor):
         self.env = env
         self.agent = agent
@@ -58,16 +71,74 @@ class EpisodeRunner:
         self.logger = logger
         self.monitor = monitor
         self.episode_cnt = 0
+        self.train_episode_cnt = 0
+        self.eval_episode_cnt = 0
+        self.eval_win_count = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
+        self.eval_pending = False
+
+        self.train_maps = usr_conf.get("env_conf", {}).get("train_maps", [1, 2, 3, 4, 5, 6, 7])
+        self.eval_maps = usr_conf.get("env_conf", {}).get("eval_maps", [8, 9, 10])
+        self.eval_interval = usr_conf.get("env_conf", {}).get("eval_interval", 10)
+        self.map_random = usr_conf.get("env_conf", {}).get("map_random", True)
+
+        self._reset_reward_accumulators()
+
+    def _reset_reward_accumulators(self):
+        self.reward_components = {
+            "survive_reward": 0.0,
+            "treasure_reward": 0.0,
+            "speed_buff_reward": 0.0,
+            "speed_buff_approach_reward": 0.0,
+            "treasure_approach_reward": 0.0,
+            "monster_dist_shaping": 0.0,
+            "late_survive_reward": 0.0,
+            "danger_penalty": 0.0,
+            "wall_collision_penalty": 0.0,
+            "flash_fail_penalty": 0.0,
+            "flash_escape_reward": 0.0,
+            "flash_survival_reward": 0.0,
+            "speed_buff_escape_reward": 0.0,
+            "safe_zone_reward": 0.0,
+            "flash_abuse_penalty": 0.0,
+            "flash_abuse_penalty_caught": 0.0,
+            "exploration_reward": 0.0,
+            "centroid_away_reward": 0.0,
+            "idle_wander_penalty": 0.0,
+            "dead_end_penalty": 0.0,
+        }
+
+    def _update_reward_accumulators(self, reward_info):
+        if reward_info:
+            for key in self.reward_components:
+                if key in reward_info:
+                    self.reward_components[key] += reward_info[key]
+
+    def _get_reward_monitor_data(self):
+        return {k: round(v, 4) for k, v in self.reward_components.items()}
+
+    def _is_eval_episode(self):
+        if self.eval_interval <= 0 or not self.eval_maps:
+            return False
+
+        # 仅在“刚达到训练间隔”时置位一次，消费后立即清零，
+        # 避免达到阈值后连续多局都被判为eval。
+        if (not self.eval_pending
+                and self.train_episode_cnt > 0
+                and self.train_episode_cnt % self.eval_interval == 0):
+            self.eval_pending = True
+
+        if self.eval_pending:
+            self.eval_pending = False
+            return True
+
+        return False
 
     def run_episodes(self):
-        """Run a single episode and yield collected samples.
-
-        执行单局对局并 yield 训练样本。
+        """Run episodes with train/eval alternation.
         """
         while True:
-            # Periodically fetch training metrics / 定期获取训练指标
             now = time.time()
             if now - self.last_get_training_metrics_time >= 60:
                 training_metrics = get_training_metrics()
@@ -75,18 +146,27 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics is {training_metrics}")
 
-            # Reset env / 重置环境
-            env_obs = self.env.reset(self.usr_conf)
+            is_eval = self._is_eval_episode()
+            if is_eval:
+                selected_map = random.choice(self.eval_maps)
+                mode = "eval"
+                self.eval_episode_cnt += 1
+            else:
+                selected_map = random.choice(self.train_maps)
+                mode = "train"
+                self.train_episode_cnt += 1
 
-            # Disaster recovery / 容灾处理
+            episode_conf = copy.deepcopy(self.usr_conf)
+            episode_conf["env_conf"]["map"] = [selected_map]
+            episode_conf["mode"] = mode
+
+            env_obs = self.env.reset(episode_conf)
             if handle_disaster_recovery(env_obs, self.logger):
                 continue
 
-            # Reset agent & load latest model / 重置 Agent 并加载最新模型
             self.agent.reset(env_obs)
             self.agent.load_model(id="latest")
 
-            # Initial observation / 初始观测处理
             obs_data, remain_info = self.agent.observation_process(env_obs)
 
             collector = []
@@ -94,18 +174,21 @@ class EpisodeRunner:
             done = False
             step = 0
             total_reward = 0.0
+            # 记录最近一次闪现动作所在的样本帧索引，用于延迟奖励/惩罚离线回填
+            last_flash_frame_idx = None
 
-            self.logger.info(f"Episode {self.episode_cnt} start")
+            self._reset_reward_accumulators()
+
+            self.logger.info(
+                f"Episode {self.episode_cnt} start | Mode: {mode} | Map: {selected_map}"
+            )
 
             while not done:
-                # Predict action / Agent 推理（随机采样）
                 act_data = self.agent.predict(list_obs_data=[obs_data])[0]
                 act = self.agent.action_process(act_data)
 
-                # Step env / 与环境交互
                 env_reward, env_obs = self.env.step(act)
 
-                # Disaster recovery / 容灾处理
                 if handle_disaster_recovery(env_obs, self.logger):
                     break
 
@@ -114,38 +197,74 @@ class EpisodeRunner:
                 step += 1
                 done = terminated or truncated
 
-                # Next observation / 处理下一步观测
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
-                # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
                 total_reward += float(reward[0])
 
-                # Terminal reward / 终局奖励
-                final_reward = np.zeros(1, dtype=np.float32)
-                if done:
-                    env_info = env_obs["observation"]["env_info"]
-                    total_score = env_info.get("total_score", 0)
+                reward_info = _remain_info.get("reward_info", {})
+                self._update_reward_accumulators(reward_info)
 
-                    if terminated:
-                        final_reward[0] = -10.0
-                        result_str = "FAIL"
-                    else:
-                        final_reward[0] = 10.0
-                        result_str = "WIN"
+                # 将延迟闪现奖励/惩罚A回填到闪现动作帧：
+                # 1) 危险闪现成功奖励 flash_escape_reward
+                # 2) 10%CD后触发的闪现衰减存活奖励 flash_survival_reward
+                # 3) 闪现后10步内被抓惩罚 flash_abuse_penalty_caught
+                flash_delayed_credit = (
+                    float(reward_info.get("flash_escape_reward", 0.0))
+                    + float(reward_info.get("flash_survival_reward", 0.0))
+                    + float(reward_info.get("flash_abuse_penalty_caught", 0.0))
+                )
 
-                    self.logger.info(
-                        f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
-                        f"result:{result_str} sim_score:{total_score:.1f} "
-                        f"total_reward:{total_reward:.3f}"
+                # 当前步reward先扣除延迟项，避免重复记到非闪现动作
+                reward_for_current = reward.copy()
+                if abs(flash_delayed_credit) > 1e-12:
+                    reward_for_current = reward_for_current - np.array(
+                        [flash_delayed_credit], dtype=np.float32
                     )
 
-                # Build sample frame / 构造样本帧
+                    # 回填到对应闪现动作帧（若存在）
+                    if (
+                        last_flash_frame_idx is not None
+                        and 0 <= last_flash_frame_idx < len(collector)
+                    ):
+                        collector[last_flash_frame_idx].reward = (
+                            collector[last_flash_frame_idx].reward
+                            + np.array([flash_delayed_credit], dtype=np.float32)
+                        )
+
+                final_reward = np.zeros(1, dtype=np.float32)
+                sim_score = 0
+                if done:
+                    env_info = env_obs["observation"]["env_info"]
+                    sim_score = env_info.get("total_score", 0)
+
+                    if terminated:
+                        final_reward[0] = -50.0
+                        result_str = "FAIL"
+                    else:
+                        final_reward[0] = 50.0
+                        result_str = "WIN"
+                        if mode == "eval":
+                            self.eval_win_count += 1
+
+                    eval_win_rate = 0.0
+                    if self.eval_episode_cnt > 0:
+                        eval_win_rate = self.eval_win_count / self.eval_episode_cnt
+
+                    self.logger.info(
+                        f"[GAMEOVER] episode:{self.episode_cnt} mode:{mode} map:{selected_map} "
+                        f"steps:{step} result:{result_str} sim_score:{sim_score:.1f} "
+                        f"total_reward:{total_reward:.3f} eval_win_rate:{eval_win_rate:.2%}"
+                    )
+
+                # 终局奖励并入训练用 reward，确保 GAE / PPO 直接学习到胜负信号。
+                shaped_reward = reward_for_current + final_reward
+
                 frame = SampleData(
                     obs=np.array(obs_data.feature, dtype=np.float32),
                     legal_action=np.array(obs_data.legal_action, dtype=np.float32),
                     act=np.array([act_data.action[0]], dtype=np.float32),
-                    reward=reward,
+                    reward=shaped_reward,
                     done=np.array([float(done)], dtype=np.float32),
                     reward_sum=np.zeros(1, dtype=np.float32),
                     value=np.array(act_data.value, dtype=np.float32).flatten()[:1],
@@ -155,19 +274,40 @@ class EpisodeRunner:
                 )
                 collector.append(frame)
 
-                # Episode end / 对局结束
-                if done:
-                    if collector:
-                        collector[-1].reward = collector[-1].reward + final_reward
+                # 当前动作为闪现时，记录其样本帧索引，供后续延迟项回填
+                if 8 <= act <= 15:
+                    last_flash_frame_idx = len(collector) - 1
 
-                    # Monitor report / 监控上报
+                if done:
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60 and self.monitor:
+                        env_info = env_obs["observation"].get("env_info", {})
+                        train_pool_size = int(len(self.train_maps))
+                        eval_pool_size = int(len(self.eval_maps))
+                        configured_total_map = int(train_pool_size + eval_pool_size)
                         monitor_data = {
                             "reward": round(total_reward + float(final_reward[0]), 4),
                             "episode_steps": step,
                             "episode_cnt": self.episode_cnt,
+                            "sim_score": sim_score,
+                            "mode": 1 if mode == "eval" else 0,
+                            "map_id": selected_map,
+                            # total_map展示为训练+评估地图总数（固定配置总量）
+                            "total_map": configured_total_map,
+                            # 保留环境原始total_map便于排查（通常为单局传入map列表长度）
+                            "env_total_map": int(env_info.get("total_map", 0) or 0),
+                            "train_map_pool_size": train_pool_size,
+                            "eval_map_pool_size": eval_pool_size,
+                            "configured_total_map": configured_total_map,
                         }
+                        if mode == "train":
+                            monitor_data["train_map_id"] = int(selected_map)
+                        monitor_data.update(self._get_reward_monitor_data())
+                        if self.eval_episode_cnt > 0:
+                            monitor_data["eval_win_rate"] = round(
+                                self.eval_win_count / self.eval_episode_cnt, 4
+                            )
+
                         self.monitor.put_data({os.getpid(): monitor_data})
                         self.last_report_monitor_time = now
 
@@ -176,6 +316,5 @@ class EpisodeRunner:
                         yield collector
                     break
 
-                # Update state / 状态更新
                 obs_data = _obs_data
                 remain_info = _remain_info

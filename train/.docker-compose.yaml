@@ -1,0 +1,240 @@
+version: '3.8'
+
+x-kaiwu-client:
+  docker_registry: kaiwu-pub.tencentcloudcr.com
+  version_path: ./code/kaiwu.json
+  monitor_url: 'http://127.0.0.1:${KAIWU_MONITOR_PORT}/p/v5/exp/monitor?domain_id=1&exp_id=1&task_uuid=1&task_id=0&platform=competition_stage'
+  extra:
+    back_to_the_realm:
+      extra_cmd: '--profile packing'
+    intelligent_traffic_lights:
+      extra_cmd: '--profile packing'
+    back_to_the_realm_v2:
+      extra_cmd: '--profile packing'
+    intelligent_traffic_lights_v2:
+      extra_cmd: '--profile packing'
+
+  # # 共享环境变量
+  environment: &env # KaiwuDRL 框架配置
+    # 未在 .env 中定义的变量（硬编码）
+    use_alloc: False
+    push_to_cos: False
+    use_rainbow: False
+    use_prometheus: True
+    prometheus_pushgateway: pushgateway:9091
+    monitor_version: v2
+    KAIWU_FEATURE_CONFIG: ""
+    KAIWU_TRAIN_TIME: 3600
+    KAIWU_RUNNING_MODE: normal
+    KAIWU_REWARD_CONFIG: ""
+    KAIWU_EXPERIMENT_ID: 0
+    KAIWU_MONITOR_VERSION: v2
+    # 在 .env 中定义的变量（从 .env 引用）
+    KAIWU_PROJECT_CODE: ${KAIWU_PROJECT_CODE}
+    KAIWU_PROJECT_VERSION: ${KAIWU_PROJECT_VERSION}
+    KAIWU_MONITOR_PORT: ${KAIWU_MONITOR_PORT}
+    KAIWU_PARALLEL_ENV_PER_AISRV: ${KAIWU_PARALLEL_ENV_PER_AISRV}
+    KAIWU_AISRV_NUM: ${KAIWU_AISRV_NUM}
+    KAIWU_TRAINING_MODE: ${KAIWU_TRAINING_MODE}
+    KAIWU_ALGORITHM: ${KAIWU_ALGORITHM}
+    KAIWU_GAMECORE_NUM: ${KAIWU_GAMECORE_NUM}
+    KAIWU_TASK_ID: ${KAIWU_TASK_ID}
+    KAIWU_TASK_UUID: ${KAIWU_TASK_UUID}
+    KAIWU_SET_CNT: ${KAIWU_SET_CNT}
+    KAIWU_SET_INDEX: ${KAIWU_SET_INDEX}
+    KAIWU_DOMAIN_TYPE: ${KAIWU_DOMAIN_TYPE}
+    KAIWU_PLAYER_TYPE: ${KAIWU_PLAYER_TYPE}
+    KAIWU_DOMAIN_ID: ${KAIWU_DOMAIN_ID}
+    KAIWU_PLAYER_ID: ${KAIWU_PLAYER_ID}
+    KAIWU_PUBLIC_KEY: ${KAIWU_PUBLIC_KEY}
+
+services:
+  # ==================== Learner 学习器 ====================
+  learner:
+    image: 'kaiwu-pub.tencentcloudcr.com/project/${KAIWU_PROJECT_CODE}/edu/cpu_${KAIWU_CPU_TYPE}:${KAIWU_PROJECT_VERSION}'
+    volumes:
+      - shared_volume_model:/workspace/train/backup_model
+      - shared_volume_train:/workspace/train
+      - '${KAIWU_TRAIN_LOG}:/workspace/log'
+      - '${KAIWU_CODE_FILE}:/workspace/code'
+    environment:
+      <<: *env
+    labels:
+      - 'kaiwu=train-check'
+    depends_on:
+      - backup_model
+      - pushgateway
+      - gamecore
+    command:
+      - bash
+      - '-c'
+      - "bash /root/tools/start_train_client.sh learner"
+    profiles:
+      - single
+      - distributed
+
+  # ==================== AISrv AI服务器 ====================
+  aisrv:
+    image: 'kaiwu-pub.tencentcloudcr.com/project/${KAIWU_PROJECT_CODE}/edu/cpu_${KAIWU_CPU_TYPE}:${KAIWU_PROJECT_VERSION}'
+    volumes:
+      - shared_volume_model:/workspace/train/backup_model
+      - shared_volume_train:/workspace/train
+      - '${KAIWU_TRAIN_LOG}:/workspace/log'
+      - '${KAIWU_CODE_FILE}:/workspace/code'
+    labels:
+      - 'kaiwu=train-check'
+    environment:
+      <<: *env
+    depends_on:
+      - pushgateway
+      - gamecore
+      - learner
+    command:
+      - bash
+      - '-c'
+      - 'bash /root/tools/start_train_client.sh aisrv'
+    scale: ${KAIWU_AISRV_NUM}
+    profiles:
+      - distributed
+
+  # ==================== KaiwuEnv 环境包装器 ====================
+  kaiwu_env:
+    image: 'kaiwu-pub.tencentcloudcr.com/project/${KAIWU_PROJECT_CODE}/edu/kaiwu_env_${KAIWU_CPU_TYPE}:${KAIWU_PROJECT_VERSION}'
+    restart: always
+    depends_on:
+      - gamecore
+      - pushgateway
+    volumes:
+      - '${KAIWU_TRAIN_LOG}:/workspace/log'
+    environment:
+      <<: *env
+    command:
+      - bash
+      - '-c'
+      - 'sleep 10000000'
+    profiles:
+      - packing
+    scale: ${KAIWU_GAMECORE_NUM}
+
+  # ==================== GameCore 游戏核心 ====================
+  gamecore:
+    image: 'kaiwu-pub.tencentcloudcr.com/project/${KAIWU_PROJECT_CODE}/edu/gamecore_${KAIWU_CPU_TYPE}:${KAIWU_PROJECT_VERSION}'
+    restart: always
+    volumes:
+      - '${KAIWU_LICENSE_PATH}:/sgame/license.dat'
+      - '${KAIWU_TRAIN_LOG}:/workspace/log'
+    environment:
+      <<: *env
+    depends_on:
+      - pushgateway
+    command:
+      - bash
+      - '-c'
+      - "bash /root/tools/start_train_client.sh gamecore"
+    scale: ${KAIWU_GAMECORE_NUM}
+
+ # ==================== Backup Model 模型备份服务 ====================
+  backup_model:
+    image: 'kaiwu-pub.tencentcloudcr.com/client/exp-service:master-b3e704f9-0202'
+    restart: always
+    volumes:
+      - shared_volume_model:/workspace/train/backup_model
+      - '${KAIWU_BACKUP_MODEL}:/workspace/train/sign_model'
+    environment:
+      <<: *env
+    command:
+      - bash
+      - '-c'
+      - |
+        cd /app/cluster/exp-service/client && \
+        ./exp client train sidecar \
+              --is-monitor=false --is-upload=false --is-sign
+
+  # ==================== Pushgateway 指标中转服务 ====================
+  # 接收 kaiwudrl 主动推送的指标，供 vector 定期拉取
+  pushgateway:
+    image: 'kaiwu-pub.tencentcloudcr.com/project/monitor/pushgateway_${KAIWU_CPU_TYPE}:20250609'
+    restart: unless-stopped
+    command:
+      - '--log.level=debug'
+      - '--persistence.file=/pushgateway/metrics.db'
+      - '--push.disable-consistency-check'
+      - '--persistence.interval=5m'
+
+  # ==================== GreptimeDB 时序数据库 ====================
+  # 提供 Prometheus 兼容接口和 SQL 查询接口
+  greptimedb:
+    image: kaiwu-pub.tencentcloudcr.com/client/greptimedb:v1.0.0-beta.3
+    restart: unless-stopped
+    command:
+      - standalone
+      - start
+      - --http-addr
+      - 0.0.0.0:4000
+      - --rpc-bind-addr
+      - 0.0.0.0:4001
+    ports:
+      - '4000:4000'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ==================== Vector 日志和指标采集 ====================
+  # 采集日志和指标，发送到 GreptimeDB
+  vector:
+    image: kaiwu-pub.tencentcloudcr.com/client/vector:v5.38.10-dev.8
+    restart: unless-stopped
+    entrypoint: ['bash', '-c', '/init_greptime.sh && /start.sh client']
+    environment:
+      <<: *env
+      greptime_host: greptimedb
+      train_metric_endpoint: http://pushgateway:9091/metrics
+    volumes:
+      - '${KAIWU_TRAIN_LOG}:/workspace/log'
+    depends_on:
+      pushgateway:
+        condition: service_started
+      greptimedb:
+        condition: service_healthy
+
+  # ==================== Monitor Service 监控服务 ====================
+  # 提供监控数据查询接口
+  monitor-service:
+    image: kaiwu-pub.tencentcloudcr.com/client/monitor-service:v5.38.10-3c07f9dc
+    restart: unless-stopped
+    ports:
+      - '${MONITOR_TRPC_PORT}:8040'
+    volumes:
+      - shared_volume_train:/workspace/train
+    depends_on:
+      greptimedb:
+        condition: service_healthy
+      vector:
+        condition: service_started
+
+  # ==================== FE Monitor Service 前端监控服务 ====================
+  # 提供监控 Web 页面
+  fe-monitor-service:
+    image: kaiwu-pub.tencentcloudcr.com/client/fe-monitor-service:20260316170132
+    restart: unless-stopped
+    ports:
+      - '${KAIWU_MONITOR_PORT}:3000'
+    environment:
+      RUNTIME_MODE: client
+      server_req_base_url: http://127.0.0.1:${MONITOR_TRPC_PORT}
+      USER_ID: ${USER_ID}
+      MONITOR_ID: ${MONITOR_ID}
+      TRACKER_ID: ${TRACKER_ID}
+      CLIENT_ENV: ${CLIENT_ENV}
+      KAIWU_CLIENT_VERSION: ${KAIWU_CLIENT_VERSION}
+      is_rainbow: false
+    depends_on:
+      monitor-service:
+        condition: service_started
+
+volumes:
+  shared_volume_model:
+  shared_volume_train:

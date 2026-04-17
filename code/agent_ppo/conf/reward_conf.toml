@@ -1,0 +1,120 @@
+[reward.global]
+# Shared thresholds/constants for reward shaping.
+birth_protection_steps = 10
+trajectory_window = 20
+safe_treasure_monster_dist = 0.2
+danger_threshold = 0.15
+late_danger_threshold = 0.25
+wall_displacement_threshold = 0.5
+normal_move_step = 1
+buff_move_step = 2
+idle_displacement_threshold = 0.25
+wander_radius_threshold = 2.5
+wander_min_points = 8
+idle_wander_reset_distance = 6.0
+dead_end_check_radius = 8
+dead_end_boundary_trace_steps = 6
+dead_end_opening_clusters_threshold = 1
+dead_end_max_reachable_cells = 90
+dead_end_max_reachable_ratio = 0.45
+dead_end_reset_distance = 8.0
+flash_fail_ratio = 0.3
+flash_expected_dist_orthogonal = 10.0
+flash_expected_dist_diagonal = 8.0
+centroid_norm_max = 64.0
+
+[reward.survive_reward]
+enable = true
+coef = 0.5
+
+[reward.treasure_reward]
+enable = true
+coef = 2.0
+
+[reward.speed_buff_reward]
+enable = true
+coef = 2.0
+
+[reward.speed_buff_approach_reward]
+enable = true
+coef = 0.2
+
+[reward.treasure_approach_reward]
+enable = true
+gravity_coef = 0.00005
+min_reward = 0.0001
+max_reward = 0.05
+min_dist_norm = 0.005
+
+[reward.monster_dist_shaping]
+enable = true
+coef = 20.0
+
+[reward.late_survive_reward]
+enable = true
+base = 0.02
+shaping_coef = 0.1
+
+[reward.danger_penalty]
+enable = true
+coef = -0.1
+power = 2.0
+
+[reward.wall_collision_penalty]
+enable = true
+coef = -0.1
+
+[reward.flash_fail_penalty]
+enable = true
+coef = -0.15
+
+[reward.flash_escape_reward]
+enable = true
+base = 1.0
+dist_gain_coef = 1.0
+
+[reward.flash_survival_reward]
+enable = true
+init = 0.5
+decay = 0.90
+
+[reward.flash_abuse_penalty]
+enable = true
+caught_within_steps = 15
+caught_coef = -1.0
+safe_zone_no_treasure_coef = -1.0
+caught_decay_enable = true
+caught_decay_min_step = 1
+caught_decay_max_step = 15
+caught_coef_start = -10.0
+caught_coef_end = -1.0
+
+[reward.speed_buff_escape_reward]
+enable = true
+init = 0.05
+decay = 0.97
+base = 1.0
+dist_delta_coef = 0.1
+
+[reward.safe_zone_reward]
+enable = true
+coef = 0.01
+
+[reward.exploration_reward]
+enable = true
+coef_per_cell = 0.0002
+
+[reward.centroid_away_reward]
+enable = true
+coef = 0.05
+
+[reward.idle_wander_penalty]
+enable = true
+idle_coef = -0.03
+wander_coef = -0.05
+idle_growth = 0.02
+wander_growth = 0.02
+
+[reward.dead_end_penalty]
+enable = false
+coef = -0.1

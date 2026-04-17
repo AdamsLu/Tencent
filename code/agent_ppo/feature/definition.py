@@ -15,7 +15,7 @@ from common_python.utils.common_func import create_cls, attached
 from agent_ppo.conf.conf import Config
 
 
-# ObsData: feature=40D vector, legal_action=8D mask / 特征向量与合法动作掩码
+# ObsData: feature=631D vector, legal_action=16D mask / 特征向量与合法动作掩码
 ObsData = create_cls("ObsData", feature=None, legal_action=None)
 
 # ActData: action, d_action(greedy), prob, value / 动作、贪心动作、概率、价值
