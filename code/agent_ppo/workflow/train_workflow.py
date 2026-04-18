@@ -235,6 +235,42 @@ class EpisodeRunner:
             "sim_score": float(sim_score),
         }
 
+    def _get_curriculum_monitor_data(self, episode_metrics=None):
+        """
+        Curriculum metrics exported to monitor panels.
+        对于 eval 局，如果没有 episode_metrics，就返回 0，避免面板断掉。
+        """
+        data = {
+            "curriculum_stage": int(self.curriculum_stage),
+            "curriculum_stage_transition_cnt": int(self.stage_transition_cnt),
+            "stage_train_episode_cnt": int(self.stage_train_episode_cnt),
+            "curriculum_window_size": int(self.curriculum_window_size),
+            "curriculum_window_fill": int(len(self.stage_metric_window)),
+            "survival_rate": 0.0,
+            "wall_collision_rate": 0.0,
+            "danger_penalty_per_step": 0.0,
+            "idle_penalty_per_step": 0.0,
+            "dead_end_penalty_per_step": 0.0,
+            "exploration_score": 0.0,
+            "treasure_count": 0.0,
+            "buff_count": 0.0,
+            "treasure_approach_reward": 0.0,
+        }
+        if episode_metrics is not None:
+            for k in [
+                "survival_rate",
+                "wall_collision_rate",
+                "danger_penalty_per_step",
+                "idle_penalty_per_step",
+                "dead_end_penalty_per_step",
+                "exploration_score",
+                "treasure_count",
+                "buff_count",
+                "treasure_approach_reward",
+            ]:
+                data[k] = round(float(episode_metrics.get(k, 0.0)), 6)
+        return data
+
     def _mean_metric(self, name):
         if not self.stage_metric_window:
             return 0.0
@@ -468,6 +504,7 @@ class EpisodeRunner:
 
                 final_reward = np.zeros(1, dtype=np.float32)
                 sim_score = 0
+                episode_metrics = None
                 if done:
                     env_info = env_obs["observation"]["env_info"]
                     sim_score = env_info.get("total_score", 0)
@@ -550,11 +587,14 @@ class EpisodeRunner:
 
                 if done:
                     now = time.time()
-                    if now - self.last_report_monitor_time >= 60 and self.monitor:
+
+                    # 如果你希望“每一局”都在面板上打一个点，就不要 60 秒节流
+                    if self.monitor:
                         env_info = env_obs["observation"].get("env_info", {})
                         train_pool_size = int(len(self.train_maps))
                         eval_pool_size = int(len(self.eval_maps))
                         configured_total_map = int(train_pool_size + eval_pool_size)
+
                         curr_stage = self._get_curriculum_stage()
 
                         monitor_data = {
@@ -565,22 +605,22 @@ class EpisodeRunner:
                             "mode": 1 if mode == "eval" else 0,
                             "map_id": selected_map,
 
-                            # total_map展示为训练+评估地图总数（固定配置总量）
+                            # total_map 展示为训练+评估地图总数（固定配置总量）
                             "total_map": configured_total_map,
-                            # 保留环境原始total_map便于排查（通常为单局传入map列表长度）
+                            # 保留环境原始 total_map 便于排查（通常为单局传入 map 列表长度）
                             "env_total_map": int(env_info.get("total_map", 0) or 0),
                             "train_map_pool_size": train_pool_size,
                             "eval_map_pool_size": eval_pool_size,
                             "configured_total_map": configured_total_map,
-
-                            # ===== 新增 =====
-                            "curriculum_stage": curr_stage,
-                            "curriculum_stage_transition_cnt": int(getattr(self, "stage_transition_cnt", 0)),
                         }
 
                         if mode == "train":
                             monitor_data["train_map_id"] = int(selected_map)
-                        monitor_data.update(self._get_reward_monitor_data())
+                            monitor_data.update(self._get_reward_monitor_data())
+
+                        # ===== 关键：把课程阶段判定指标也塞进 monitor =====
+                        monitor_data.update(self._get_curriculum_monitor_data(episode_metrics))
+
                         if self.eval_episode_cnt > 0:
                             monitor_data["eval_win_rate"] = round(
                                 self.eval_win_count / self.eval_episode_cnt, 4

@@ -448,6 +448,164 @@ def build_monitor():
         )
         .end_panel()
         .end_group()
+        .add_group(
+            group_name="课程阶段指标",
+            group_name_en="curriculum_metrics",
+        )
+        .add_panel(
+            name="当前课程阶段",
+            name_en="curriculum_stage",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_stage",
+            expr="avg(curriculum_stage{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="阶段切换次数",
+            name_en="curriculum_stage_transition_cnt",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_stage_transition_cnt",
+            expr="avg(curriculum_stage_transition_cnt{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="阶段内训练局数",
+            name_en="stage_train_episode_cnt",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="stage_train_episode_cnt",
+            expr="avg(stage_train_episode_cnt{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="阶段窗口大小",
+            name_en="curriculum_window_size",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_window_size",
+            expr="avg(curriculum_window_size{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="阶段窗口已填充",
+            name_en="curriculum_window_fill",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_window_fill",
+            expr="avg(curriculum_window_fill{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="生存率",
+            name_en="survival_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="survival_rate",
+            expr="avg(survival_rate{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="撞墙率",
+            name_en="wall_collision_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="wall_collision_rate",
+            expr="avg(wall_collision_rate{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="单步危险惩罚",
+            name_en="danger_penalty_per_step",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="danger_penalty_per_step",
+            expr="avg(danger_penalty_per_step{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="探索分数",
+            name_en="exploration_score",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="exploration_score",
+            expr="avg(exploration_score{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="单步徘徊惩罚",
+            name_en="idle_penalty_per_step",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="idle_penalty_per_step",
+            expr="avg(idle_penalty_per_step{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="单步死角惩罚",
+            name_en="dead_end_penalty_per_step",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="dead_end_penalty_per_step",
+            expr="avg(dead_end_penalty_per_step{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="宝箱数估计",
+            name_en="treasure_count",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="treasure_count",
+            expr="avg(treasure_count{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="Buff数估计",
+            name_en="buff_count",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="buff_count",
+            expr="avg(buff_count{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="宝箱接近奖励",
+            name_en="treasure_approach_reward",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="treasure_approach_reward",
+            expr="avg(treasure_approach_reward{})",
+        )
+        .end_panel()
+        .end_group()
         .build()
     )
     return config_dict

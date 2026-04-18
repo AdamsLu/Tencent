@@ -48,22 +48,22 @@ max_step = 1000
 
 [curriculum]
 initial_stage = 1
-metric_window_size = 30
-min_train_episodes_per_stage = 30
+metric_window_size = 20
+min_train_episodes_per_stage = 20
 
 [curriculum.stage1_to_stage2]
-avg_survival_rate = 0.35
-max_wall_collision_rate = 0.025
-max_danger_penalty_per_step = 0.015
+avg_survival_rate = 0.22
+max_wall_collision_rate = 0.08
+max_danger_penalty_per_step = 0.035
 
 [curriculum.stage2_to_stage3]
-avg_survival_rate = 0.55
-min_exploration_score = 0.08
-max_idle_penalty_per_step = 0.010
-max_dead_end_penalty_per_step = 0.004
+avg_survival_rate = 0.38
+min_exploration_score = 0.03
+max_idle_penalty_per_step = 0.03
+max_dead_end_penalty_per_step = 0.02
 
 [curriculum.stage3_to_stage4]
-avg_survival_rate = 0.70
-min_treasure_count = 0.80
-min_buff_count = 0.20
-min_treasure_approach_reward = 0.03
+avg_survival_rate = 0.52
+min_treasure_count = 0.30
+min_buff_count = 0.08
+min_treasure_approach_reward = 0.01
