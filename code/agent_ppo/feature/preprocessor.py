@@ -54,8 +54,11 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 
 import os
 import copy
+import logging
 from collections import deque
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import tomllib
@@ -91,7 +94,9 @@ def _norm(v, v_max, v_min=0.0):
 class Preprocessor:
     def __init__(self):
         self._debug_dump_obs_fields = os.environ.get("KAIWU_DUMP_OBS_FIELDS", "0") == "1"
+        self._debug_flash_mask = True
         self._obs_field_dumped = False
+        self._flash_mask_debug_last_state = None
         self.reward_cfg = self._default_reward_config()
         self.reset()
 
@@ -423,6 +428,7 @@ class Preprocessor:
         self.discovered_treasure_regions = set()
         self.visited_region_anchors = set()
         self.visited_far_trajectory_regions = set()
+        self._flash_mask_debug_last_state = None
 
     def _is_half_surrounded_dead_end(self, map_info):
         """Detect dead-end by ray probing + boundary tracing + compactness.
@@ -2148,9 +2154,54 @@ class Preprocessor:
                 legal_action = [1 if j in valid_set else 0 for j in range(16)]
 
         raw_legal_action = legal_action.copy()
+
         if sum(legal_action) == 0:
             legal_action = [1] * 16
             raw_legal_action = legal_action.copy()
+
+        # ===== 显式检查闪现CD：8~15 视为8个方向闪现动作 =====
+        # 优先读取 hero 中的 flash_cooldown，若缺失再回退到 env_info。
+        flash_cd = float(hero.get("flash_cooldown", env_info.get("flash_cooldown", 0.0)))
+        flash_ready = flash_cd <= 1e-6
+
+        raw_flash_legal = raw_legal_action[8:16].copy()
+        flash_masked_by_cd = False
+
+        if not flash_ready:
+            # 同时裁剪 legal_action 和 raw_legal_action，
+            # 避免后面的 fallback 又把 CD 中的闪现动作放回来。
+            for i in range(8, 16):
+                if legal_action[i] == 1 or raw_legal_action[i] == 1:
+                    flash_masked_by_cd = True
+                legal_action[i] = 0
+                raw_legal_action[i] = 0
+
+        # ===== flash mask 调试输出（仅在开启环境变量时打印）=====
+        # 环境变量：
+        #   export KAIWU_DEBUG_FLASH_MASK=1
+        if self._debug_flash_mask:
+            curr_debug_state = (
+                int(self.step_no),
+                int(flash_ready),
+                int(round(flash_cd)),
+                tuple(int(x) for x in raw_flash_legal),
+                int(flash_masked_by_cd),
+            )
+
+            if curr_debug_state != self._flash_mask_debug_last_state:
+                logger.info(
+                    "[flash_mask] step:%d stage:%d(%s) flash_cd:%.2f flash_ready:%d "
+                    "raw_flash_legal:%s flash_masked_by_cd:%d final_flash_legal_before_move:%s",
+                    int(self.step_no),
+                    int(self.get_curriculum_stage()),
+                    self.get_curriculum_stage_name(),
+                    float(flash_cd),
+                    int(flash_ready),
+                    str([int(x) for x in raw_flash_legal]),
+                    int(flash_masked_by_cd),
+                    str([int(x) for x in legal_action[8:16]]),
+                )
+                self._flash_mask_debug_last_state = curr_debug_state
 
         # 预处理0-7移动动作合法性：普通/加速邻域检测
         has_speed_buff = float(hero.get("buff_remaining_time", 0)) > 0
@@ -2162,7 +2213,7 @@ class Preprocessor:
         legal_after_move_mask = legal_action.copy()
 
         # 资源直达优先（宝箱 / buff）只在后续阶段启用。
-        # Stage 1 明确关闭该逻辑，避免“只学活下来”阶段被资源动作偏置干扰。
+        # Stage 1/2 明确关闭该逻辑，避免前期课程阶段被资源动作偏置干扰。
         if not self._is_survival_only_stage():
             # 在已有合法mask上做宝箱检测：
             # 1) 若动作在一步内可摸到宝箱，则其视为“可执行吃宝箱动作”。
@@ -2171,8 +2222,14 @@ class Preprocessor:
             move_step = int(self._global_cfg("buff_move_step", 2)) if has_speed_buff else int(
                 self._global_cfg("normal_move_step", 1)
             )
-            treasure_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=1)
-            speed_buff_touch_steps = self._find_target_touch_steps(hero_pos, organs, move_step, target_sub_type=2)
+
+            treasure_touch_steps = self._find_target_touch_steps(
+                hero_pos, organs, move_step, target_sub_type=1
+            )
+            speed_buff_touch_steps = self._find_target_touch_steps(
+                hero_pos, organs, move_step, target_sub_type=2
+            )
+
             enable_speed_buff_mask = not has_speed_buff
 
             if has_speed_buff:
@@ -2189,6 +2246,7 @@ class Preprocessor:
                 )
                 and legal_action[i] == 1
             ]
+
             if direct_touch_legal:
                 for i in range(8):
                     legal_action[i] = 1 if i in direct_touch_legal else 0
@@ -2208,6 +2266,16 @@ class Preprocessor:
                 legal_action = [int(x) for x in raw_legal_action]
             else:
                 legal_action = [0] * 16
+
+        # 若希望看最终 fallback 之后闪现动作是否仍被放开，也打印一次。
+        if self._debug_flash_mask:
+            logger.info(
+                "[flash_mask_final] step:%d stage:%d(%s) final_legal_action_8_15:%s",
+                int(self.step_no),
+                int(self.get_curriculum_stage()),
+                self.get_curriculum_stage_name(),
+                str([int(x) for x in legal_action[8:16]]),
+            )
 
         # Progress features (2D) / 进度特征
         step_norm = _norm(self.step_no, self.max_step)
