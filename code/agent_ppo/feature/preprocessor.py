@@ -325,11 +325,13 @@ class Preprocessor:
 
     def reset(self):
         """Reset per-episode state for reward computation.
-
-        每局开始时重置奖励计算所需的状态变量。
+        每局开始时只重置“局内状态”，不重置“训练阶段”。
         """
-        self._load_reward_config()
 
+        # ===== 保留跨局课程阶段 =====
+        prev_stage = int(getattr(self, "curriculum_stage", 1))
+
+        self._load_reward_config()
         self.step_no = 0
         self.max_step = 200
 
@@ -367,6 +369,7 @@ class Preprocessor:
 
         # 加速期间逃离奖励当前值（衰减稠密，获取buff时重置为初始值）
         self.speed_buff_escape_decay = 0.0
+
         # 上一帧是否持有加速buff（用于检测buff获取时刻）
         self.last_had_speed_buff = False
 
@@ -392,8 +395,9 @@ class Preprocessor:
 
         # ========== 轨迹质心 / 远离奖励 ==========
         # 记录英雄最近N步的坐标轨迹，用于计算质心
-        self.TRAJECTORY_WINDOW = int(self._global_cfg("trajectory_window", 20))  # 滑动窗口大小
-        self.trajectory_buffer = []  # [(x, z), ...] 坐标列表
+        self.TRAJECTORY_WINDOW = int(self._global_cfg("trajectory_window", 20))
+        # 滑动窗口大小
+        self.trajectory_buffer = []  # [(x, z), ...]
 
         # ========== 原地/徘徊惩罚状态 ==========
         # 连续原地步数（步数越长惩罚越重）
@@ -411,9 +415,7 @@ class Preprocessor:
         # 存储最新的reward_info供agent获取
         self.last_reward_info = {}
 
-        # ========== 课程训练阶段控制 ==========
-        # 保留外部 workflow 设置的 stage，不在每局 reset 时回退到 1
-        prev_stage = int(getattr(self, "curriculum_stage", 1))
+        # ========== 恢复跨局课程阶段 ==========
         self.curriculum_stage = max(1, min(4, prev_stage))
 
         # ========== 高层探索事件记忆 ==========

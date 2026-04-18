@@ -337,6 +337,7 @@ def build_monitor():
             expr="avg(sim_score{})",
         )
         .end_panel()
+
         .add_panel(
             name="评估局胜率",
             name_en="eval_win_rate",
@@ -347,6 +348,7 @@ def build_monitor():
             expr="avg(eval_win_rate{})",
         )
         .end_panel()
+
         .add_panel(
             name="训练-评估模式",
             name_en="mode",
@@ -357,6 +359,7 @@ def build_monitor():
             expr="avg(mode{})",
         )
         .end_panel()
+
         .add_panel(
             name="地图ID",
             name_en="map_id",
@@ -367,6 +370,7 @@ def build_monitor():
             expr="avg(map_id{})",
         )
         .end_panel()
+
         .add_panel(
             name="训练地图ID",
             name_en="train_map_id",
@@ -377,6 +381,7 @@ def build_monitor():
             expr="avg(train_map_id{})",
         )
         .end_panel()
+
         .add_panel(
             name="地图总数训评",
             name_en="total_map",
@@ -387,6 +392,7 @@ def build_monitor():
             expr="avg(total_map{})",
         )
         .end_panel()
+
         .add_panel(
             name="训练可用地图数",
             name_en="train_map_pool_size",
@@ -397,6 +403,7 @@ def build_monitor():
             expr="avg(train_map_pool_size{})",
         )
         .end_panel()
+
         .add_panel(
             name="评估可用地图数",
             name_en="eval_map_pool_size",
@@ -405,6 +412,39 @@ def build_monitor():
         .add_metric(
             metrics_name="eval_map_pool_size",
             expr="avg(eval_map_pool_size{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="当前课程阶段",
+            name_en="curriculum_stage",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_stage",
+            expr="avg(curriculum_stage{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="阶段切换次数",
+            name_en="curriculum_stage_transition_cnt",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="curriculum_stage_transition_cnt",
+            expr="avg(curriculum_stage_transition_cnt{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="局步数",
+            name_en="episode_steps",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="episode_steps",
+            expr="avg(episode_steps{})",
         )
         .end_panel()
         .end_group()

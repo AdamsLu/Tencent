@@ -132,6 +132,23 @@ class EpisodeRunner:
     def _get_reward_monitor_data(self):
         return {k: round(v, 4) for k, v in self.reward_components.items()}
 
+    def _get_curriculum_stage(self):
+        preprocessor = getattr(self.agent, "preprocessor", None)
+        if preprocessor is None:
+            return 1
+        return int(getattr(preprocessor, "curriculum_stage", 1))
+
+    def _get_curriculum_stage_name(self, stage=None):
+        if stage is None:
+            stage = self._get_curriculum_stage()
+        stage_name_map = {
+            1: "survival_base",
+            2: "explore_and_stabilize",
+            3: "safe_resource_acquisition",
+            4: "full_game_and_skill_refine",
+        }
+        return stage_name_map.get(int(stage), "unknown")
+
     def _apply_curriculum_stage_to_agent(self):
         if hasattr(self.agent, "preprocessor") and self.agent.preprocessor is not None:
             self.agent.preprocessor.set_curriculum_stage(self.curriculum_stage)
@@ -379,21 +396,25 @@ class EpisodeRunner:
             self.agent.load_model(id="latest")
 
             obs_data, remain_info = self.agent.observation_process(env_obs)
-
             collector = []
+
             self.episode_cnt += 1
             done = False
             step = 0
             total_reward = 0.0
+
             # 记录最近一次闪现动作所在的样本帧索引，用于延迟奖励/惩罚离线回填
             last_flash_frame_idx = None
 
             self._reset_reward_accumulators()
 
+            curr_stage = self._get_curriculum_stage()
+            curr_stage_name = self._get_curriculum_stage_name(curr_stage)
+
             self.logger.info(
                 f"Episode {self.episode_cnt} start | "
                 f"Mode: {mode} | Map: {selected_map} | "
-                f"Stage: {self.curriculum_stage} ({self._get_stage_name()})"
+                f"Stage: {curr_stage} ({curr_stage_name})"
             )
 
             while not done:
@@ -464,9 +485,12 @@ class EpisodeRunner:
                     if self.eval_episode_cnt > 0:
                         eval_win_rate = self.eval_win_count / self.eval_episode_cnt
 
+                    curr_stage = self._get_curriculum_stage()
+                    curr_stage_name = self._get_curriculum_stage_name(curr_stage)
+
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} mode:{mode} map:{selected_map} "
-                        f"stage:{self.curriculum_stage}({self._get_stage_name()}) "
+                        f"stage:{curr_stage}({curr_stage_name}) "
                         f"steps:{step} result:{result_str} sim_score:{sim_score:.1f} "
                         f"total_reward:{total_reward:.3f} eval_win_rate:{eval_win_rate:.2%}"
                     )
@@ -531,6 +555,8 @@ class EpisodeRunner:
                         train_pool_size = int(len(self.train_maps))
                         eval_pool_size = int(len(self.eval_maps))
                         configured_total_map = int(train_pool_size + eval_pool_size)
+                        curr_stage = self._get_curriculum_stage()
+
                         monitor_data = {
                             "reward": round(total_reward + float(final_reward[0]), 4),
                             "episode_steps": step,
@@ -538,6 +564,7 @@ class EpisodeRunner:
                             "sim_score": sim_score,
                             "mode": 1 if mode == "eval" else 0,
                             "map_id": selected_map,
+
                             # total_map展示为训练+评估地图总数（固定配置总量）
                             "total_map": configured_total_map,
                             # 保留环境原始total_map便于排查（通常为单局传入map列表长度）
@@ -545,9 +572,12 @@ class EpisodeRunner:
                             "train_map_pool_size": train_pool_size,
                             "eval_map_pool_size": eval_pool_size,
                             "configured_total_map": configured_total_map,
-                            "curriculum_stage": int(self.curriculum_stage),
-                            "curriculum_stage_transition_cnt": int(self.stage_transition_cnt),
+
+                            # ===== 新增 =====
+                            "curriculum_stage": curr_stage,
+                            "curriculum_stage_transition_cnt": int(getattr(self, "stage_transition_cnt", 0)),
                         }
+
                         if mode == "train":
                             monitor_data["train_map_id"] = int(selected_map)
                         monitor_data.update(self._get_reward_monitor_data())
