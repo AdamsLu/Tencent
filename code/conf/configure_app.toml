@@ -60,12 +60,10 @@ preload_model = false
 
 # The relative path of the preloaded model folder (the variable name {agent_name} refers to the agent_algorithm name directory in the code package). It is only effective when preload_model=true. When the preload model function is enabled, you need to create a new ckpt folder under the agent_algorithm name directory in the code package and place the model file (.pkl) there.
 # 预加载模型文件夹相对路径(变量名{agent_name}指代码包中agent_算法名目录)，仅在preload_model=true时生效；当开启预加载模型功能时，需要在代码包中agent_算法名目录下新建ckpt文件夹，将模型文件（.pkl）放置此即可。
-preload_model_dir = "{agent_name}/ckpt"
+preload_model_dir = "agent_ppo/ckpt"
 
 # The identification ID of the preloaded model (here refers to the number of model training steps). This ID corresponds to the number of training steps recorded in the model file name. It only takes effect when preload_model=true.
 # Note that it is forbidden to modify the original model file name, otherwise the model preloading process will fail.
 # 预加载模型的标识ID（这里指模型训练步数），该ID对应模型文件名中的训练步数记录。仅在preload_model=true时生效。
 # 注意，禁止修改原始模型文件名，否则将导致模型预加载流程失败。
-preload_model_id = 1000
-eval_model_dir = "/data/projects/gorge_chase/ckpt"
-eval_model_id = "10239"
+preload_model_id = 72986

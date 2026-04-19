@@ -10,14 +10,18 @@ Agent class for Gorge Chase PPO.
 峡谷追猎 PPO Agent 主类。
 """
 
-import torch
+import os
+import json
+import zipfile
+import tempfile
+import glob
 
+import torch
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import numpy as np
 from kaiwudrl.interface.agent import BaseAgent
-
 from agent_ppo.algorithm.algorithm import Algorithm
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import ActData, ObsData
@@ -31,31 +35,40 @@ class Agent(BaseAgent):
         self.device = device
         self.model = Model(device).to(self.device)
 
-        # Actor/Critic 全分离参数组：各自独立学习率。
-        actor_params = (
-            list(self.model.actor_feature_encoders.parameters())
-            + list(self.model.actor_encoder.parameters())
-            + list(self.model.actor_head.parameters())
-        )
-        critic_params = (
-            list(self.model.critic_feature_encoders.parameters())
-            + list(self.model.critic_encoder.parameters())
-            + list(self.model.critic_head.parameters())
-        )
+        # 分组学习率：actor单独下调；共享encoder与critic使用原学习率。
+        actor_params = list(self.model.actor_head.parameters())
+        critic_params = list(self.model.critic_head.parameters())
+        encoder_params = list(self.model.encoder.parameters())
         self.optimizer = torch.optim.Adam(
             params=[
                 {"params": actor_params, "lr": Config.ACTOR_LEARNING_RATE_START},
                 {"params": critic_params, "lr": Config.CRITIC_LEARNING_RATE_START},
+                {"params": encoder_params, "lr": Config.CRITIC_LEARNING_RATE_START},
             ],
             betas=(0.9, 0.999),
             eps=1e-8,
         )
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, logger, monitor)
-        self.preprocessor = Preprocessor(logger=logger, monitor=monitor)
+        self.preprocessor = Preprocessor()
         self.last_action = -1
         self.logger = logger
         self.monitor = monitor
         super().__init__(agent_type, device, logger, monitor)
+        # ===== resume from packaged zip =====
+        default_resume_zip = os.path.join(
+            os.path.dirname(__file__),
+            "init_models",
+            "resume_model.zip",
+        )
+        self._resume_zip_path = os.environ.get(
+            "KAIWU_RESUME_ZIP", default_resume_zip
+        ).strip()
+
+        # 在本次训练第一次成功 save_model 之前，始终优先用 zip 初始化，
+        # 避免平台外层反复 load_model_by_source 时把模型又覆盖回“从头开始”的状态。
+        self._resume_zip_hold_until_save = os.path.isfile(self._resume_zip_path)
+        self._resume_zip_loaded = False
+        self._resume_extract_dir = None
 
     def reset(self, env_obs=None):
         """Reset per-episode state.
@@ -65,10 +78,54 @@ class Agent(BaseAgent):
         self.preprocessor.reset()
         self.last_action = -1
 
-    def set_episode_mode(self, mode):
-        """Set current episode mode for preprocessor diagnostics routing."""
-        if hasattr(self.preprocessor, "set_episode_mode"):
-            self.preprocessor.set_episode_mode(mode)
+    def _resolve_resume_model_from_zip(self):
+        if not self._resume_zip_path or not os.path.isfile(self._resume_zip_path):
+            return None
+
+        if self._resume_extract_dir is None:
+            self._resume_extract_dir = tempfile.mkdtemp(prefix="kaiwu_resume_")
+            with zipfile.ZipFile(self._resume_zip_path, "r") as zf:
+                zf.extractall(self._resume_extract_dir)
+
+        meta_path = os.path.join(self._resume_extract_dir, "ckpt", "kaiwu.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            model_paths = meta.get("model_file_path") or []
+            if model_paths:
+                candidate = os.path.join(self._resume_extract_dir, model_paths[0])
+                if os.path.isfile(candidate):
+                    return candidate
+
+        # fallback: 自动找 ckpt 目录里的 pkl
+        matches = sorted(
+            glob.glob(os.path.join(self._resume_extract_dir, "ckpt", "model.ckpt-*.pkl"))
+        )
+        if matches:
+            return matches[-1]
+
+        return None
+
+    def _try_load_resume_zip(self):
+        if not self._resume_zip_hold_until_save:
+            return False
+
+        model_file_path = self._resolve_resume_model_from_zip()
+        if not model_file_path:
+            if self.logger:
+                self.logger.warning(
+                    f"resume zip enabled but no valid checkpoint found in {self._resume_zip_path}"
+                )
+            return False
+
+        self.model.load_state_dict(torch.load(model_file_path, map_location=self.device))
+        self._resume_zip_loaded = True
+
+        if self.logger:
+            self.logger.info(
+                f"resume training from packaged zip model: {model_file_path}"
+            )
+        return True
 
     def observation_process(self, env_obs):
         """Convert raw env_obs to ObsData and remain_info.
@@ -99,8 +156,8 @@ class Agent(BaseAgent):
 
             _, value, prob = self._run_model(feature, legal_action)
 
-            action = self._legal_sample_with_mask(prob, legal_action, use_max=False)
-            d_action = self._legal_sample_with_mask(prob, legal_action, use_max=True)
+            action = self._legal_sample(prob, use_max=False)
+            d_action = self._legal_sample(prob, use_max=True)
 
             list_act_data.append(
                 ActData(
@@ -130,44 +187,26 @@ class Agent(BaseAgent):
         return self.algorithm.learn(list_sample_data)
 
     def save_model(self, path=None, id="1"):
-        """Save model checkpoint.
-
-        保存模型检查点。
-        """
+        """Save model checkpoint."""
         model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
         state_dict_cpu = {k: v.clone().cpu() for k, v in self.model.state_dict().items()}
         torch.save(state_dict_cpu, model_file_path)
         self.logger.info(f"save model {model_file_path} successfully")
 
+        # 一旦本次训练已经成功保存出新模型，就恢复平台默认的 checkpoint 流程
+        self._resume_zip_hold_until_save = False
+
     def load_model(self, path=None, id="1"):
         """Load model checkpoint.
-
-        加载模型检查点。
+        优先支持从指定 zip 初始化训练；在第一次 save_model 之前持续生效。
         """
-        model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
-        ckpt_state = torch.load(model_file_path, map_location=self.device)
-        try:
-            self.model.load_state_dict(ckpt_state)
-            self.logger.info(f"load model {model_file_path} successfully")
+        # 先尝试用用户指定的 zip 初始化
+        if self._try_load_resume_zip():
             return
-        except RuntimeError:
-            # 兼容旧版共享网络权重：feature_encoders/encoder -> actor_* 与 critic_*。
-            remapped_state = dict(ckpt_state)
-            for k, v in ckpt_state.items():
-                if k.startswith("feature_encoders."):
-                    suffix = k[len("feature_encoders."):]
-                    remapped_state[f"actor_feature_encoders.{suffix}"] = v
-                    remapped_state[f"critic_feature_encoders.{suffix}"] = v
-                elif k.startswith("encoder."):
-                    suffix = k[len("encoder."):]
-                    remapped_state[f"actor_encoder.{suffix}"] = v
-                    remapped_state[f"critic_encoder.{suffix}"] = v
 
-            missing_keys, unexpected_keys = self.model.load_state_dict(remapped_state, strict=False)
-            self.logger.info(
-                f"load model {model_file_path} with compatibility remap successfully; "
-                f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}"
-            )
+        model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
+        self.model.load_state_dict(torch.load(model_file_path, map_location=self.device))
+        self.logger.info(f"load model {model_file_path} successfully")
 
     def action_process(self, act_data, is_stochastic=True):
         """Unpack ActData to int action and update last_action.
@@ -223,42 +262,3 @@ class Agent(BaseAgent):
         if use_max:
             return int(np.argmax(probs))
         return int(np.argmax(np.random.multinomial(1, probs, size=1)))
-
-    def _legal_sample_with_mask(self, probs, legal_action, use_max=False):
-        """Sample action strictly inside legal_action support.
-
-        在 legal_action 掩码约束下采样/贪心选动作，保证动作索引一定合法。
-        """
-        probs_np = np.asarray(probs, dtype=np.float64)
-        mask_np = np.asarray(legal_action, dtype=np.float64)
-        if probs_np.ndim != 1:
-            probs_np = probs_np.reshape(-1)
-        if mask_np.ndim != 1:
-            mask_np = mask_np.reshape(-1)
-
-        n = int(min(len(probs_np), len(mask_np)))
-        if n <= 0:
-            return 0
-
-        probs_np = probs_np[:n]
-        mask_np = mask_np[:n]
-        legal_idx = np.flatnonzero(mask_np > 0.5)
-
-        # 防御性兜底：若掩码异常全0，退化为全动作集合，避免崩溃。
-        if len(legal_idx) == 0:
-            legal_idx = np.arange(n, dtype=np.int64)
-
-        legal_probs = np.clip(probs_np[legal_idx], 0.0, None)
-
-        if use_max:
-            if float(np.sum(legal_probs)) <= 1e-12:
-                return int(legal_idx[0])
-            return int(legal_idx[int(np.argmax(legal_probs))])
-
-        prob_sum = float(np.sum(legal_probs))
-        if prob_sum <= 1e-12:
-            return int(np.random.choice(legal_idx))
-
-        legal_probs = legal_probs / prob_sum
-        sampled = np.random.multinomial(1, legal_probs, size=1)
-        return int(legal_idx[int(np.argmax(sampled))])
