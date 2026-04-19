@@ -78,6 +78,11 @@ class Algorithm:
         self.optimizer.step()
         self.train_step += 1
 
+        adv_raw = advantage.view(-1)
+        adv_mean = float(adv_raw.mean().item())
+        adv_std = float(adv_raw.std(unbiased=False).item())
+        adv_abs_mean = float(torch.abs(adv_raw).mean().item())
+
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
             results = {
@@ -90,6 +95,9 @@ class Algorithm:
                 "clip_rate": round(info_list[5].item(), 6),
                 "clip_abs_overflow": round(info_list[6].item(), 6),
                 "reward": round(reward.mean().item(), 4),
+                "adv": round(adv_abs_mean, 6),
+                "adv_mean": round(adv_mean, 6),
+                "adv_std": round(adv_std, 6),
             }
             self.logger.info(
                 f"[train] total_loss:{results['total_loss']} "
@@ -99,7 +107,10 @@ class Algorithm:
                 f"explained_variance:{results['explained_variance']} "
                 f"clip_count:{results['clip_count']} "
                 f"clip_rate:{results['clip_rate']} "
-                f"clip_abs_overflow:{results['clip_abs_overflow']}"
+                f"clip_abs_overflow:{results['clip_abs_overflow']} "
+                f"adv:{results['adv']} "
+                f"adv_mean:{results['adv_mean']} "
+                f"adv_std:{results['adv_std']}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
@@ -132,6 +143,7 @@ class Algorithm:
         clip_low = 1.0 - self.clip_param
         clip_high = 1.0 + self.clip_param
         adv = advantage.view(-1, 1)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         policy_loss1 = -ratio * adv
         clipped_ratio = ratio.clamp(clip_low, clip_high)
         policy_loss2 = -clipped_ratio * adv

@@ -67,5 +67,3 @@ preload_model_dir = "{agent_name}/ckpt"
 # 预加载模型的标识ID（这里指模型训练步数），该ID对应模型文件名中的训练步数记录。仅在preload_model=true时生效。
 # 注意，禁止修改原始模型文件名，否则将导致模型预加载流程失败。
 preload_model_id = 1000
-eval_model_dir = "/data/projects/gorge_chase/ckpt"
-eval_model_id = "10239"
