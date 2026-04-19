@@ -98,6 +98,7 @@ class EpisodeRunner:
         self.stage_train_episode_cnt = 0
         self.stage_transition_cnt = 0
         self._reset_reward_accumulators()
+        self.last_eval_trigger_train_episode = -1
 
     def _reset_reward_accumulators(self):
         self.reward_components = {
@@ -235,40 +236,34 @@ class EpisodeRunner:
             "sim_score": float(sim_score),
         }
 
-    def _get_curriculum_monitor_data(self, episode_metrics=None):
-        """
-        Curriculum metrics exported to monitor panels.
-        对于 eval 局，如果没有 episode_metrics，就返回 0，避免面板断掉。
-        """
-        data = {
+    def _get_curriculum_progress_monitor_data(self):
+        """Always-on curriculum progress metrics."""
+        return {
             "curriculum_stage": int(self.curriculum_stage),
             "curriculum_stage_transition_cnt": int(self.stage_transition_cnt),
             "stage_train_episode_cnt": int(self.stage_train_episode_cnt),
             "curriculum_window_size": int(self.curriculum_window_size),
             "curriculum_window_fill": int(len(self.stage_metric_window)),
-            "survival_rate": 0.0,
-            "wall_collision_rate": 0.0,
-            "danger_penalty_per_step": 0.0,
-            "idle_penalty_per_step": 0.0,
-            "dead_end_penalty_per_step": 0.0,
-            "exploration_score": 0.0,
-            "treasure_count": 0.0,
-            "buff_count": 0.0,
-            "treasure_approach_reward": 0.0,
         }
-        if episode_metrics is not None:
-            for k in [
-                "survival_rate",
-                "wall_collision_rate",
-                "danger_penalty_per_step",
-                "idle_penalty_per_step",
-                "dead_end_penalty_per_step",
-                "exploration_score",
-                "treasure_count",
-                "buff_count",
-                "treasure_approach_reward",
-            ]:
-                data[k] = round(float(episode_metrics.get(k, 0.0)), 6)
+
+    def _get_curriculum_episode_monitor_data(self, episode_metrics):
+        """Train-only curriculum decision metrics."""
+        if episode_metrics is None:
+            return {}
+
+        data = {}
+        for k in [
+            "survival_rate",
+            "wall_collision_rate",
+            "danger_penalty_per_step",
+            "idle_penalty_per_step",
+            "dead_end_penalty_per_step",
+            "exploration_score",
+            "treasure_count",
+            "buff_count",
+            "treasure_approach_reward",
+        ]:
+            data[k] = round(float(episode_metrics.get(k, 0.0)), 6)
         return data
 
     def _mean_metric(self, name):
@@ -385,15 +380,12 @@ class EpisodeRunner:
         if self.eval_interval <= 0 or not self.eval_maps:
             return False
 
-        # 仅在“刚达到训练间隔”时置位一次，消费后立即清零，
-        # 避免达到阈值后连续多局都被判为eval。
-        if (not self.eval_pending
-                and self.train_episode_cnt > 0
-                and self.train_episode_cnt % self.eval_interval == 0):
-            self.eval_pending = True
-
-        if self.eval_pending:
-            self.eval_pending = False
+        if (
+            self.train_episode_cnt > 0
+            and self.train_episode_cnt % self.eval_interval == 0
+            and self.train_episode_cnt != self.last_eval_trigger_train_episode
+        ):
+            self.last_eval_trigger_train_episode = self.train_episode_cnt
             return True
 
         return False
@@ -618,9 +610,13 @@ class EpisodeRunner:
                             monitor_data["train_map_id"] = int(selected_map)
                             monitor_data.update(self._get_reward_monitor_data())
 
-                        # ===== 关键：把课程阶段判定指标也塞进 monitor =====
-                        monitor_data.update(self._get_curriculum_monitor_data(episode_metrics))
+                        # 阶段进度指标：每局都可以上报
+                        monitor_data.update(self._get_curriculum_progress_monitor_data())
 
+                        # 阶段判定指标：只在 train 局上报，避免 eval 局补零污染折线图
+                        if mode == "train":
+                            monitor_data.update(self._get_curriculum_episode_monitor_data(episode_metrics))
+                        
                         if self.eval_episode_cnt > 0:
                             monitor_data["eval_win_rate"] = round(
                                 self.eval_win_count / self.eval_episode_cnt, 4
