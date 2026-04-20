@@ -51,6 +51,7 @@ class Agent(BaseAgent):
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, logger, monitor)
         self.preprocessor = Preprocessor()
         self.last_action = -1
+        self._last_legal_action = None
         self.logger = logger
         self.monitor = monitor
         super().__init__(agent_type, device, logger, monitor)
@@ -69,6 +70,7 @@ class Agent(BaseAgent):
         self._resume_zip_hold_until_save = os.path.isfile(self._resume_zip_path)
         self._resume_zip_loaded = False
         self._resume_extract_dir = None
+        
 
     def reset(self, env_obs=None):
         """Reset per-episode state.
@@ -136,6 +138,8 @@ class Agent(BaseAgent):
         feature, legal_action, reward = self.preprocessor.feature_process(
             env_obs, self.last_action
         )
+        self._last_legal_action = list(legal_action)
+
         obs_data = ObsData(
             feature=list(feature),
             legal_action=legal_action,
@@ -213,9 +217,23 @@ class Agent(BaseAgent):
 
         解包 ActData 为 int 动作并记录 last_action。
         """
-        action = act_data.action if is_stochastic else act_data.d_action
-        self.last_action = int(action[0])
-        return int(action[0])
+        chosen = act_data.action if is_stochastic else act_data.d_action
+        final_action = int(chosen[0])
+
+        stochastic_action = int(act_data.action[0]) if len(act_data.action) > 0 else None
+        greedy_action = int(act_data.d_action[0]) if len(act_data.d_action) > 0 else None
+
+        print(
+            "[action_send_debug]",
+            "returned_action=", final_action,
+            "stochastic_action=", stochastic_action,
+            "greedy_action=", greedy_action,
+            "is_stochastic=", is_stochastic,
+            "legal_action=", self._last_legal_action,
+        )
+
+        self.last_action = final_action
+        return final_action
 
     def _run_model(self, feature, legal_action):
         """Run model inference with vector input, return logits, value, prob.

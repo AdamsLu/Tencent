@@ -176,7 +176,10 @@ class Preprocessor:
                 "normal_move_step": 1,
                 "buff_move_step": 2,
                 "danger_threshold_steps": 6.0,
-                "flash_step": 4,
+                # 与环境动作表一致：
+                # 直线闪现 10 格；对角闪现 8 格
+                "flash_step_cardinal": 10,
+                "flash_step_diagonal": 8,
             },
             "survive_reward": {"enable": True, "coef": 0.02},
             "treasure_reward": {"enable": True, "coef": 1.0},
@@ -310,6 +313,13 @@ class Preprocessor:
 
         self.step_count = 0
         self.last_reward_info: Dict[str, float] = {}
+        self.monster_oov_bucket_counter = {}
+        self.prev_move_mask_for_last_action = None
+        self.prev_flash_mask_for_last_action = None
+        self.prev_legal_action_for_last_action = None
+        self.prev_simulated_next_positions = None
+        self.prev_move_mask_debug = None
+        self.prev_map_info_debug = None
 
     # ---------------------------------------------------------------------
     # 协议解析辅助：尽量兼容不同 env_obs 结构
@@ -367,11 +377,23 @@ class Preprocessor:
                 ("monsters",),
                 ("monster",),
                 ("monster_states",),
+
                 ("frame_state", "monsters"),
                 ("frame_state", "monster"),
                 ("frame_state", "monster_states"),
+
                 ("observation", "monsters"),
+                ("observation", "monster"),
+                ("observation", "monster_states"),
+
+                # 关键补充：你的日志里 env_obs 是 observation.frame_state.*
+                ("observation", "frame_state", "monsters"),
+                ("observation", "frame_state", "monster"),
+                ("observation", "frame_state", "monster_states"),
+
                 ("obs", "monsters"),
+                ("obs", "monster"),
+                ("obs", "monster_states"),
             ],
             default=None,
         )
@@ -388,11 +410,23 @@ class Preprocessor:
                 ("organs",),
                 ("organ",),
                 ("organ_states",),
+
                 ("frame_state", "organs"),
                 ("frame_state", "organ"),
                 ("frame_state", "organ_states"),
+
                 ("observation", "organs"),
+                ("observation", "organ"),
+                ("observation", "organ_states"),
+
+                # 关键补充
+                ("observation", "frame_state", "organs"),
+                ("observation", "frame_state", "organ"),
+                ("observation", "frame_state", "organ_states"),
+
                 ("obs", "organs"),
+                ("obs", "organ"),
+                ("obs", "organ_states"),
             ],
             default=None,
         )
@@ -409,10 +443,23 @@ class Preprocessor:
                 ("map_info",),
                 ("map",),
                 ("local_map",),
+
                 ("frame_state", "map_info"),
                 ("frame_state", "map"),
+                ("frame_state", "local_map"),
+
                 ("observation", "map_info"),
+                ("observation", "map"),
+                ("observation", "local_map"),
+
+                # 关键补充
+                ("observation", "frame_state", "map_info"),
+                ("observation", "frame_state", "map"),
+                ("observation", "frame_state", "local_map"),
+
                 ("obs", "map_info"),
+                ("obs", "map"),
+                ("obs", "local_map"),
             ],
             default=None,
         )
@@ -432,8 +479,16 @@ class Preprocessor:
             [
                 ("env_info",),
                 ("game_info",),
+
                 ("frame_state", "env_info"),
                 ("frame_state", "game_info"),
+
+                ("observation", "env_info"),
+                ("observation", "game_info"),
+
+                # 关键补充
+                ("observation", "frame_state", "env_info"),
+                ("observation", "frame_state", "game_info"),
             ],
             default=None,
         )
@@ -444,12 +499,27 @@ class Preprocessor:
     def _extract_done_flags(self, env_obs: Dict[str, Any]) -> Tuple[bool, bool]:
         terminated = self._get_from_paths(
             env_obs,
-            [("terminated",), ("done",), ("frame_state", "terminated"), ("frame_state", "done")],
+            [
+                ("terminated",),
+                ("done",),
+                ("frame_state", "terminated"),
+                ("frame_state", "done"),
+                ("observation", "terminated"),
+                ("observation", "done"),
+                ("observation", "frame_state", "terminated"),
+                ("observation", "frame_state", "done"),
+            ],
             default=False,
         )
+
         truncated = self._get_from_paths(
             env_obs,
-            [("truncated",), ("frame_state", "truncated")],
+            [
+                ("truncated",),
+                ("frame_state", "truncated"),
+                ("observation", "truncated"),
+                ("observation", "frame_state", "truncated"),
+            ],
             default=False,
         )
         return bool(terminated), bool(truncated)
@@ -790,6 +860,270 @@ class Preprocessor:
 
         return best_dist, best_obj, best_mode
 
+    def _get_monster_field_from_paths(
+        self,
+        monster: Dict[str, Any],
+        paths: Sequence[Sequence[str]],
+        default: Any = None,
+    ) -> Any:
+        for path in paths:
+            cur = monster
+            ok = True
+            for key in path:
+                if isinstance(cur, dict) and key in cur:
+                    cur = cur[key]
+                else:
+                    ok = False
+                    break
+            if ok:
+                return cur
+        return default
+
+    def _parse_direction_id(self, raw_dir: Any) -> Optional[int]:
+        """
+        统一解析怪物相对方向，输出与 _relative_direction_id 一致的 1~8 编码：
+        1=东, 2=东北, 3=北, 4=西北, 5=西, 6=西南, 7=南, 8=东南
+        """
+        if raw_dir is None:
+            return None
+
+        # 数字直接解析
+        try:
+            d = int(raw_dir)
+            if 1 <= d <= 8:
+                return d
+        except Exception:
+            pass
+
+        # 字符串兜底
+        s = str(raw_dir).strip().lower()
+        mapping = {
+            "e": 1, "east": 1, "东": 1,
+            "ne": 2, "northeast": 2, "north_east": 2, "东北": 2,
+            "n": 3, "north": 3, "北": 3,
+            "nw": 4, "northwest": 4, "north_west": 4, "西北": 4,
+            "w": 5, "west": 5, "西": 5,
+            "sw": 6, "southwest": 6, "south_west": 6, "西南": 6,
+            "s": 7, "south": 7, "南": 7,
+            "se": 8, "southeast": 8, "south_east": 8, "东南": 8,
+        }
+        return mapping.get(s, None)
+
+    def _extract_monster_out_of_view_hint(
+        self,
+        monster: Dict[str, Any],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """
+        提取视野外怪物的方向 + 距离桶提示。
+
+        当前从日志确认到的字段：
+        - hero_relative_direction: 相对方向
+        - hero_l2_distance: 相对距离桶 / 距离等级
+        - is_in_view: 是否在视野内（0 表示不在视野内）
+        """
+        if not isinstance(monster, dict):
+            return None, None
+
+        # 若怪物明确在视野内，就不走这个 hint 分支
+        is_in_view = monster.get("is_in_view", None)
+        try:
+            if is_in_view is not None and int(is_in_view) == 1:
+                return None, None
+        except Exception:
+            pass
+
+        # 先读你环境里已经确认存在的字段
+        raw_dir = monster.get("hero_relative_direction", None)
+        raw_bucket = monster.get("hero_l2_distance", None)
+
+        # 再保留一层兜底，避免后续环境字段轻微变化
+        if raw_dir is None:
+            raw_dir = self._get_monster_field_from_paths(
+                monster,
+                [
+                    ("rel_direction",),
+                    ("relative_direction",),
+                    ("direction",),
+                    ("dir",),
+                    ("feature", "rel_direction"),
+                    ("feature", "relative_direction"),
+                    ("feature", "direction"),
+                    ("relative", "direction"),
+                ],
+                default=None,
+            )
+
+        if raw_bucket is None:
+            raw_bucket = self._get_monster_field_from_paths(
+                monster,
+                [
+                    ("distance_bucket",),
+                    ("dist_bucket",),
+                    ("relative_distance_bucket",),
+                    ("distance_level",),
+                    ("distance_bin",),
+                    ("euclid_bucket_id",),
+                    ("feature", "distance_bucket"),
+                    ("feature", "dist_bucket"),
+                    ("relative", "distance_bucket"),
+                ],
+                default=None,
+            )
+
+        direction_id = self._parse_direction_id(raw_dir)
+
+        bucket_id = None
+        try:
+            bucket_id = int(raw_bucket)
+        except Exception:
+            bucket_id = None
+
+        if bucket_id is not None:
+            bucket_id = int(np.clip(bucket_id, 0, 5))
+
+        print(
+            "[monster_hint_parse]",
+            "raw_dir=", raw_dir,
+            "raw_bucket=", raw_bucket,
+            "direction_id=", direction_id,
+            "bucket_id=", bucket_id,
+            "is_in_view=", is_in_view,
+        )
+
+        return direction_id, bucket_id
+
+    def _debug_print_out_of_view_monsters(
+        self,
+        hero_pos: Dict[str, int],
+        monsters: List[Dict[str, Any]],
+        map_info: Optional[List[List[int]]],
+        every_n_steps: int = 20,
+    ) -> None:
+        """
+        调试打印：
+        1) 视野外 monster 的原始字段
+        2) 方向 / 距离桶解析结果
+        3) 若能解析，打印近似目标位置
+        为避免刷屏，默认每 20 step 打一次。
+        """
+        if every_n_steps <= 0:
+            every_n_steps = 1
+        if (self.step_count % every_n_steps) != 0:
+            return
+
+        print("\n[monster_oov_debug] step=", self.step_count, "hero_pos=", hero_pos)
+
+        for idx, m in enumerate(monsters):
+            pos = m.get("pos", {}) if isinstance(m, dict) else {}
+            mx, mz = _safe_int(pos.get("x", 0)), _safe_int(pos.get("z", 0))
+
+            target_pos = None
+            if self._is_valid_global(mx, mz) and not (mx == 0 and mz == 0):
+                target_pos = {"x": mx, "z": mz}
+
+            # 判断是否在当前局部视野内
+            is_visible = False
+            if target_pos is not None:
+                is_visible = self._is_in_local_window(hero_pos, target_pos, LOCAL_HALF)
+
+            # 只打印“视野外”怪物
+            if is_visible:
+                continue
+
+            direction_id, dist_bucket = self._extract_monster_out_of_view_hint(m)
+            if dist_bucket is not None:
+                self.monster_oov_bucket_counter[dist_bucket] = self.monster_oov_bucket_counter.get(dist_bucket, 0) + 1
+
+            print("    oov_bucket_counter =", self.monster_oov_bucket_counter)
+
+            approx_target = None
+            if direction_id is not None and dist_bucket is not None:
+                steps = self._monster_bucket_to_steps(dist_bucket)
+                dx, dz = self._direction_id_to_delta(direction_id)
+                approx_target = {
+                    "x": int(np.clip(int(hero_pos["x"]) + dx * steps, 0, MAP_SIZE - 1)),
+                    "z": int(np.clip(int(hero_pos["z"]) + dz * steps, 0, MAP_SIZE - 1)),
+                }
+
+            print("\n  [monster_oov_debug:item]", idx)
+            print("    raw_monster =", m)
+            print("    raw_keys    =", list(m.keys()) if isinstance(m, dict) else None)
+            print("    pos         =", pos)
+            print("    target_pos  =", target_pos)
+            print("    is_visible  =", is_visible)
+            print("    direction_id=", direction_id)
+            print("    dist_bucket =", dist_bucket)
+            print("    approx_target =", approx_target)
+
+    def _direction_id_to_delta(self, direction_id: int) -> Tuple[int, int]:
+        """
+        与 _relative_direction_id 的编码保持一致。
+        """
+        mapping = {
+            1: (1, 0),    # 东
+            2: (1, 1),    # 东北
+            3: (0, 1),    # 北
+            4: (-1, 1),   # 西北
+            5: (-1, 0),   # 西
+            6: (-1, -1),  # 西南
+            7: (0, -1),   # 南
+            8: (1, -1),   # 东南
+        }
+        return mapping.get(int(direction_id), (0, 0))
+
+    def _monster_bucket_to_steps(self, bucket_id: int) -> int:
+        """
+        把距离桶映射成一个单调递增的近似步数。
+        这里只求“相对合理 + 单调”，用于 shaping，不追求精确测距。
+        """
+        bucket_to_steps = {
+            0: 1,
+            1: 3,
+            2: 5,
+            3: 7,
+            4: 10,
+            5: 14,
+        }
+        return int(bucket_to_steps.get(int(bucket_id), 14))
+
+    def _compute_out_of_view_escape_bonus(
+        self,
+        prev_hero_pos: Optional[Dict[str, int]],
+        hero_pos: Dict[str, int],
+        monster: Optional[Dict[str, Any]],
+    ) -> float:
+        """
+        视野外怪物的额外方向奖励：
+        - 朝“远离怪物”的方向移动 -> 正
+        - 朝“接近怪物”的方向移动 -> 负
+        - 与怪物方向正交或没动 -> 接近 0
+        返回值裁剪到 [-1, 1]
+        """
+        if prev_hero_pos is None or not isinstance(monster, dict):
+            return 0.0
+
+        direction_id, _ = self._extract_monster_out_of_view_hint(monster)
+        if direction_id is None:
+            return 0.0
+
+        move_dx = int(hero_pos["x"]) - int(prev_hero_pos["x"])
+        move_dz = int(hero_pos["z"]) - int(prev_hero_pos["z"])
+        if move_dx == 0 and move_dz == 0:
+            return 0.0
+
+        monster_dx, monster_dz = self._direction_id_to_delta(direction_id)
+        # away vector = 怪物方向的反方向
+        away_dx, away_dz = -monster_dx, -monster_dz
+
+        dot = float(move_dx * away_dx + move_dz * away_dz)
+        move_norm = float(np.sqrt(move_dx * move_dx + move_dz * move_dz))
+        away_norm = float(np.sqrt(away_dx * away_dx + away_dz * away_dz))
+        if move_norm < 1e-6 or away_norm < 1e-6:
+            return 0.0
+
+        score = dot / (move_norm * away_norm)
+        return float(np.clip(score, -1.0, 1.0))
+
     def _chebyshev_distance(
         self,
         a: Dict[str, int],
@@ -805,62 +1139,91 @@ class Preprocessor:
        return int(max(abs(ax - bx), abs(az - bz)))
 
     def compute_monster_distance(
-            self,
-            start_pos: Dict[str, int],
-            target_pos: Dict[str, int],
-            map_info: Optional[List[List[int]]] = None,
-        ) -> Dict[str, Any]:
+        self,
+        start_pos: Dict[str, int],
+        target_pos: Optional[Dict[str, int]] = None,
+        map_info: Optional[List[List[int]]] = None,
+        monster: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         怪物专用距离接口。
 
-        返回：
-        {
-            "distance": Optional[int],
-            "mode": "visible_path" | "explored_path" | "visible_fallback" | "unknown",
-        }
-
-        规则：
-        1) 先用相对坐标判断怪物是否在当前21x21视野内；
-        2) 若在视野内，优先在局部视野图上做 BFS；
-        3) 若局部 BFS 不可达，则尝试在已探索地图上做 BFS；
-        4) 若两种 BFS 都失败，但怪物仍在当前视野内，则使用 8邻接几何距离 作为兜底；
-        5) 否则返回 None / unknown。
+        返回 mode：
+        - visible_path
+        - explored_path
+        - visible_fallback
+        - out_of_view_direction_only
+        - out_of_view_hint
+        - unknown
         """
-        is_visible = self._is_in_local_window(start_pos, target_pos, LOCAL_HALF)
+        has_valid_target = False
+        is_visible = False
 
-        dx = int(target_pos["x"]) - int(start_pos["x"])
-        dz = int(target_pos["z"]) - int(start_pos["z"])
-        print(
-            "[monster_distance_debug]",
-            "start=", start_pos,
-            "target=", target_pos,
-            "dx=", dx,
-            "dz=", dz,
-            "is_visible=", self._is_in_local_window(start_pos, target_pos, LOCAL_HALF),
-        )
+        if isinstance(target_pos, dict):
+            tx = _safe_int(target_pos.get("x", 0))
+            tz = _safe_int(target_pos.get("z", 0))
+            if self._is_valid_global(tx, tz) and not (tx == 0 and tz == 0):
+                has_valid_target = True
+                target_pos = {"x": tx, "z": tz}
+                is_visible = self._is_in_local_window(start_pos, target_pos, LOCAL_HALF)
 
         # 1) 当前视野内局部 BFS
-        if is_visible and map_info is not None:
+        if has_valid_target and is_visible and map_info is not None:
             start_rc = (LOCAL_HALF, LOCAL_HALF)
             goal_rc = self._visible_local_rc(start_pos, target_pos)
-
-            # goal_rc 必须落在当前局部图范围内
-            if goal_rc is not None:
-                dist_local = self._bfs_local_distance(map_info, start_rc, goal_rc)
-                if dist_local is not None:
-                    return {"distance": int(dist_local), "mode": "visible_path"}
+            dist_local = self._bfs_local_distance(map_info, start_rc, goal_rc)
+            if dist_local is not None:
+                return {
+                    "distance": int(dist_local),
+                    "mode": "visible_path",
+                }
 
         # 2) 已探索地图 BFS
-        dist_explored = self._bfs_explored_distance(start_pos, target_pos)
-        if dist_explored is not None:
-            return {"distance": int(dist_explored), "mode": "explored_path"}
+        if has_valid_target:
+            dist_explored = self._bfs_explored_distance(start_pos, target_pos)
+            if dist_explored is not None:
+                return {
+                    "distance": int(dist_explored),
+                    "mode": "explored_path",
+                }
 
-        # 3) 视野内兜底：8邻接几何距离
-        if is_visible:
+        # 3) 视野内兜底
+        if has_valid_target and is_visible:
             fallback_dist = self._chebyshev_distance(start_pos, target_pos)
-            return {"distance": int(fallback_dist), "mode": "visible_fallback"}
+            return {
+                "distance": int(fallback_dist),
+                "mode": "visible_fallback",
+            }
 
-        # 4) 不可计算
+        # 4) 视野外 hint
+        if isinstance(monster, dict):
+            direction_id, dist_bucket = self._extract_monster_out_of_view_hint(monster)
+
+            # 4.1 只有方向，没有可靠距离：只返回方向模式
+            if direction_id is not None and (dist_bucket is None or dist_bucket == 0):
+                return {
+                    "distance": None,
+                    "mode": "out_of_view_direction_only",
+                    "direction_id": int(direction_id),
+                    "distance_bucket": dist_bucket,
+                }
+
+            # 4.2 方向 + 距离都可靠时，再启用近似距离
+            if direction_id is not None and dist_bucket is not None:
+                approx_dist = self._monster_bucket_to_steps(dist_bucket)
+                dir_dx, dir_dz = self._direction_id_to_delta(direction_id)
+                approx_target_pos = {
+                    "x": int(np.clip(int(start_pos["x"]) + dir_dx * approx_dist, 0, MAP_SIZE - 1)),
+                    "z": int(np.clip(int(start_pos["z"]) + dir_dz * approx_dist, 0, MAP_SIZE - 1)),
+                }
+                return {
+                    "distance": int(approx_dist),
+                    "mode": "out_of_view_hint",
+                    "direction_id": int(direction_id),
+                    "distance_bucket": int(dist_bucket),
+                    "approx_target_pos": approx_target_pos,
+                }
+
         return {"distance": None, "mode": "unknown"}
 
     def _nearest_known_monster_distance(
@@ -871,38 +1234,113 @@ class Preprocessor:
     ) -> Tuple[Optional[int], Optional[Dict[str, Any]], str]:
         """
         返回最近怪物的距离、对应怪物对象、以及距离模式。
-
-        距离优先级：
-        1) 当前视野内局部 BFS 距离（visible_path）
-        2) 已探索地图 BFS 距离（explored_path）
-        3) 当前视野内 8邻接几何兜底距离（visible_fallback）
-        4) 都不可计算则 unknown
         """
         best_dist: Optional[int] = None
         best_obj: Optional[Dict[str, Any]] = None
         best_mode = "unknown"
 
+        # 先存“有距离”的候选
+        distance_candidates: List[Tuple[int, Dict[str, Any], str]] = []
+        # 再存“只有方向”的候选
+        direction_only_candidates: List[Tuple[Dict[str, Any], str]] = []
+
         for m in monsters:
-            pos = m.get("pos", {})
+            pos = m.get("pos", {}) if isinstance(m, dict) else {}
             tx, tz = _safe_int(pos.get("x", 0)), _safe_int(pos.get("z", 0))
-            if not self._is_valid_global(tx, tz):
-                continue
+
+            target_pos = None
+            if self._is_valid_global(tx, tz) and not (tx == 0 and tz == 0):
+                target_pos = {"x": tx, "z": tz}
 
             dist_info = self.compute_monster_distance(
-                hero_pos,
-                {"x": tx, "z": tz},
-                map_info,
+                start_pos=hero_pos,
+                target_pos=target_pos,
+                map_info=map_info,
+                monster=m,
             )
-            d = dist_info["distance"]
-            if d is None:
+            d = dist_info.get("distance", None)
+            mode = str(dist_info.get("mode", "unknown"))
+
+            if d is not None:
+                distance_candidates.append((int(d), m, mode))
+            elif mode == "out_of_view_direction_only":
+                direction_only_candidates.append((m, mode))
+
+        if distance_candidates:
+            distance_candidates.sort(key=lambda x: x[0])
+            best_dist, best_obj, best_mode = distance_candidates[0]
+            return best_dist, best_obj, best_mode
+
+        if direction_only_candidates:
+            best_obj, best_mode = direction_only_candidates[0]
+            return None, best_obj, best_mode
+
+        return None, None, "unknown"
+
+    def _resolve_monster_reference_position(
+        self,
+        hero_pos: Dict[str, int],
+        monster: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, int]], str]:
+        """
+        基于“当前 hero 位置”解析怪物参考绝对位置：
+        1) 若 env 已给出可靠绝对坐标，则直接用；
+        2) 否则若给了 视野外方向 + 距离桶，则构造一个近似绝对位置；
+        3) 否则返回 None。
+        """
+        if not isinstance(monster, dict):
+            return None, "unknown"
+
+        pos = monster.get("pos", {})
+        mx, mz = _safe_int(pos.get("x", 0)), _safe_int(pos.get("z", 0))
+        if self._is_valid_global(mx, mz) and not (mx == 0 and mz == 0):
+            return {"x": mx, "z": mz}, "absolute"
+
+        direction_id, dist_bucket = self._extract_monster_out_of_view_hint(monster)
+        if direction_id is None or dist_bucket is None or dist_bucket == 0:
+            return None, "unknown"
+
+        approx_steps = self._monster_bucket_to_steps(dist_bucket)
+        dx, dz = self._direction_id_to_delta(direction_id)
+
+        ax = int(np.clip(int(hero_pos["x"]) + dx * approx_steps, 0, MAP_SIZE - 1))
+        az = int(np.clip(int(hero_pos["z"]) + dz * approx_steps, 0, MAP_SIZE - 1))
+        
+        print(
+            "[resolve_monster_ref_debug]",
+            "step=", self.step_count,
+            "hero_pos=", hero_pos,
+            "raw_monster=", monster,
+            "direction_id=", direction_id,
+            "dist_bucket=", dist_bucket,
+        )
+        return {"x": ax, "z": az}, "hint"
+
+    def _build_planning_monsters(
+        self,
+        hero_pos: Dict[str, int],
+        monsters: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        为候选动作评估构造“固定参考怪物位置”列表。
+
+        关键点：
+        - 对视野外怪物，方向/距离桶是“相对当前 hero”的观测；
+        - 在评估 next_pos 时，不能把这个 hint 重新相对 next_pos 解释，
+          否则等于把怪物也跟着 hero 一起平移了；
+        - 所以要先基于当前 hero 固定出一个参考绝对位置，再用它评估 next_pos。
+        """
+        out: List[Dict[str, Any]] = []
+        for m in monsters:
+            ref_pos, source = self._resolve_monster_reference_position(hero_pos, m)
+            if ref_pos is None:
                 continue
 
-            if best_dist is None or d < best_dist:
-                best_dist = d
-                best_obj = m
-                best_mode = str(dist_info["mode"])
-
-        return best_dist, best_obj, best_mode
+            mm = dict(m)
+            mm["pos"] = {"x": int(ref_pos["x"]), "z": int(ref_pos["z"])}
+            mm["_planning_source"] = source
+            out.append(mm)
+        return out
 
     def _is_in_local_window(
             self,
@@ -1059,8 +1497,8 @@ class Preprocessor:
         """
         保持 14 维以兼容现有 Config。
         含义：
-        [visible, active, rel_x, rel_z, path_dist_norm, path_bucket_norm, dir_id_norm,
-         speed_norm, mode_visible, mode_explored, mode_known, abs_x_norm, abs_z_norm, reserved]
+        [visible, active, rel_x, rel_z, dist_norm, dist_bucket_norm, dir_id_norm,
+         speed_norm, mode_visible, mode_explored, mode_known, abs_x_norm, abs_z_norm, mode_hint]
         """
         feat = np.zeros(14, dtype=np.float32)
         if not isinstance(monster, dict):
@@ -1068,36 +1506,65 @@ class Preprocessor:
 
         pos = monster.get("pos", {})
         mx, mz = _safe_int(pos.get("x", 0)), _safe_int(pos.get("z", 0))
-        if not self._is_valid_global(mx, mz):
-            return feat
-        if mx == 0 and mz == 0:
+        target_pos = None
+        if self._is_valid_global(mx, mz) and not (mx == 0 and mz == 0):
+            target_pos = {"x": mx, "z": mz}
+
+        dist_info = self.compute_monster_distance(
+            start_pos=hero_pos,
+            target_pos=target_pos,
+            map_info=map_info,
+            monster=monster,
+        )
+
+        dist_val = dist_info.get("distance", None)
+        mode = str(dist_info.get("mode", "unknown"))
+        if dist_val is None:
             return feat
 
-        dist_info = self.compute_path_distance(hero_pos, {"x": mx, "z": mz}, map_info)
-        path_dist = dist_info["distance"]
-        mode = str(dist_info["mode"])
-        visible = 1.0 if mode == "visible" else 0.0
-        known = 1.0 if path_dist is not None else 0.0
+        # 用于构建相对/绝对位置特征的“参考位置”
+        ref_pos = None
+        direction_id = None
+        dist_bucket = None
 
-        dx = mx - int(hero_pos["x"])
-        dz = mz - int(hero_pos["z"])
-        direction_id = _relative_direction_id(hero_pos, {"x": mx, "z": mz})
+        if mode == "out_of_view_hint":
+            ref_pos = dist_info.get("approx_target_pos", None)
+            direction_id = dist_info.get("direction_id", None)
+            dist_bucket = dist_info.get("distance_bucket", None)
+        else:
+            ref_pos = target_pos
+            if ref_pos is not None:
+                direction_id = _relative_direction_id(hero_pos, ref_pos)
+            if dist_val is not None:
+                dist_bucket = _bucketize_distance(float(dist_val))
+
+        if ref_pos is None:
+            return feat
+
+        rx, rz = int(ref_pos["x"]), int(ref_pos["z"])
+        dx = rx - int(hero_pos["x"])
+        dz = rz - int(hero_pos["z"])
+
+        visible_flag = 1.0 if mode in {"visible_path", "visible_fallback"} else 0.0
+        explored_flag = 1.0 if mode == "explored_path" else 0.0
+        known_flag = 1.0 if dist_val is not None else 0.0
+        hint_flag = 1.0 if mode == "out_of_view_hint" else 0.0
         speed = _safe_float(monster.get("speed", monster.get("move_speed", 0.0)), 0.0)
 
-        feat[0] = visible
+        feat[0] = visible_flag
         feat[1] = 1.0
         feat[2] = float(dx) / float(MAP_SIZE)
         feat[3] = float(dz) / float(MAP_SIZE)
-        feat[4] = 1.0 if path_dist is None else _norm(path_dist, MAP_SIZE * 2.0)
-        feat[5] = 1.0 if path_dist is None else _norm(min(_bucketize_distance(path_dist), 5), 5.0)
-        feat[6] = float(direction_id) / 8.0
+        feat[4] = _norm(float(dist_val), MAP_SIZE * 2.0)
+        feat[5] = 0.0 if dist_bucket is None else _norm(min(int(dist_bucket), 5), 5.0)
+        feat[6] = 0.0 if direction_id is None else float(direction_id) / 8.0
         feat[7] = _norm(speed, 5.0)
-        feat[8] = 1.0 if mode == "visible" else 0.0
-        feat[9] = 1.0 if mode == "explored" else 0.0
-        feat[10] = known
-        feat[11] = _norm(mx, MAP_SIZE - 1)
-        feat[12] = _norm(mz, MAP_SIZE - 1)
-        feat[13] = 0.0
+        feat[8] = visible_flag
+        feat[9] = explored_flag
+        feat[10] = known_flag
+        feat[11] = _norm(rx, MAP_SIZE - 1)
+        feat[12] = _norm(rz, MAP_SIZE - 1)
+        feat[13] = hint_flag
         return feat
 
     # ---------------------------------------------------------------------
@@ -1152,6 +1619,24 @@ class Preprocessor:
         return mask
 
     def _preprocess_flash_action_mask(self, map_info: Optional[List[List[int]]], flash_cd_norm: float) -> List[int]:
+        """
+        闪现动作合法性判断。
+
+        与环境动作表保持一致：
+        - 8:  右  -> 10 格
+        - 9:  右上 -> 8 格
+        - 10: 上  -> 10 格
+        - 11: 左上 -> 8 格
+        - 12: 左  -> 10 格
+        - 13: 左下 -> 8 格
+        - 14: 下  -> 10 格
+        - 15: 右下 -> 8 格
+
+        说明：
+        这里仍保持“只检查落点格是否可通行”的逻辑；
+        这和你当前代码风格一致，只是把步长改对。
+        若后续确认环境要求闪现路径中间也不能穿障碍，再进一步改成路径检查版本。
+        """
         if flash_cd_norm > 1e-6:
             return [0] * 8
         if map_info is None:
@@ -1164,10 +1649,30 @@ class Preprocessor:
         rows, cols = arr.shape
         center_r = rows // 2
         center_c = cols // 2
-        flash_step = int(self._global_cfg("flash_step", 4))
+
+        # 方向顺序与环境表一致：
+        # 右, 右上, 上, 左上, 左, 左下, 下, 右下
         dirs8 = [
-            (0, 1), (-1, 1), (-1, 0), (-1, -1),
-            (0, -1), (1, -1), (1, 0), (1, 1),
+            (0, 1),    # E
+            (-1, 1),   # NE
+            (-1, 0),   # N
+            (-1, -1),  # NW
+            (0, -1),   # W
+            (1, -1),   # SW
+            (1, 0),    # S
+            (1, 1),    # SE
+        ]
+
+        # 与环境动作表一致：直线10、对角8
+        flash_steps = [
+            int(self._global_cfg("flash_step_cardinal", 10)),   # E
+            int(self._global_cfg("flash_step_diagonal", 8)),    # NE
+            int(self._global_cfg("flash_step_cardinal", 10)),   # N
+            int(self._global_cfg("flash_step_diagonal", 8)),    # NW
+            int(self._global_cfg("flash_step_cardinal", 10)),   # W
+            int(self._global_cfg("flash_step_diagonal", 8)),    # SW
+            int(self._global_cfg("flash_step_cardinal", 10)),   # S
+            int(self._global_cfg("flash_step_diagonal", 8)),    # SE
         ]
 
         def is_passable(r: int, c: int) -> bool:
@@ -1175,9 +1680,11 @@ class Preprocessor:
 
         mask = [1] * 8
         for i, (dr, dc) in enumerate(dirs8):
-            rr = center_r + dr * flash_step
-            cc = center_c + dc * flash_step
+            step = max(1, int(flash_steps[i]))
+            rr = center_r + dr * step
+            cc = center_c + dc * step
             mask[i] = 1 if is_passable(rr, cc) else 0
+
         return mask
 
     def _simulate_next_position(
@@ -1387,6 +1894,9 @@ class Preprocessor:
         )
         safe_quad = self._safe_quadrant_id(hero_pos, monsters)
 
+        # 固定“当前帧下怪物的参考绝对位置”，供 next_pos 评估使用
+        planning_monsters = self._build_planning_monsters(hero_pos, monsters)
+
         for a in range(8):
             next_pos, next_r, next_c = self._simulate_next_position(hero_pos, map_info, a, has_speed_buff)
             base = a * feat_per_action
@@ -1395,12 +1905,11 @@ class Preprocessor:
             out[base + 0] = _norm(next_pos["x"], MAP_SIZE - 1)
             out[base + 1] = _norm(next_pos["z"], MAP_SIZE - 1)
 
-            # 3) 下一位置到最近怪物的沿路距离
-            next_monster_dist, _, _ = self._nearest_known_target_distance(
+            # 3) 下一位置到最近怪物的距离
+            next_monster_dist, _, _ = self._nearest_known_monster_distance(
                 next_pos,
-                [{"sub_type": -1, "status": 1, "pos": m.get("pos", {})} for m in monsters],
+                planning_monsters,
                 map_info,
-                target_sub_type=None,
             )
             out[base + 2] = 1.0 if next_monster_dist is None else _norm(next_monster_dist, MAP_SIZE * 2.0)
 
@@ -1429,6 +1938,17 @@ class Preprocessor:
                 dead_end = 1.0 if self._is_local_dead_end(local_map) else 0.0
             out[base + 6] = dead_end
 
+            print(
+                "[candidate_action_debug]",
+                "step=", self.step_count,
+                "action=", a,
+                "hero_pos=", hero_pos,
+                "next_pos=", next_pos,
+                "move_mask[a]=", None if a >= len(self._preprocess_move_action_mask(map_info, has_speed_buff)) else self._preprocess_move_action_mask(map_info, has_speed_buff)[a],
+                "next_r=", next_r,
+                "next_c=", next_c,
+            )
+
         return out.astype(np.float32)
 
     def _build_action_risk_benefit_features(
@@ -1443,7 +1963,6 @@ class Preprocessor:
         """
         8 × 4 = 32 维：
         [risk_monster, risk_dead_end, benefit_treasure, benefit_openness]
-        这里也改成沿路距离驱动。
         """
         feat_per_action = 4
         out = np.zeros(8 * feat_per_action, dtype=np.float32)
@@ -1451,9 +1970,11 @@ class Preprocessor:
         cur_treasure_dist, _, _ = self._nearest_known_target_distance(
             hero_pos, treasure_targets, map_info, target_sub_type=1
         )
-        cur_monster_dist, _, monster_dist_mode = self._nearest_known_monster_distance(
+
+        planning_monsters = self._build_planning_monsters(hero_pos, monsters)
+        cur_monster_dist, _, _ = self._nearest_known_monster_distance(
             hero_pos,
-            monsters,
+            planning_monsters,
             map_info,
         )
 
@@ -1464,11 +1985,11 @@ class Preprocessor:
                 continue
 
             next_pos, next_r, next_c = self._simulate_next_position(hero_pos, map_info, a, has_speed_buff)
-            next_monster_dist, _, _ = self._nearest_known_target_distance(
+
+            next_monster_dist, _, _ = self._nearest_known_monster_distance(
                 next_pos,
-                [{"sub_type": -1, "status": 1, "pos": m.get("pos", {})} for m in monsters],
+                planning_monsters,
                 map_info,
-                target_sub_type=None,
             )
             next_treasure_dist, _, _ = self._nearest_known_target_distance(
                 next_pos, treasure_targets, map_info, target_sub_type=1
@@ -1481,13 +2002,10 @@ class Preprocessor:
                 if cur_monster_dist is None:
                     risk_monster = 1.0 / (1.0 + float(next_monster_dist))
                 else:
-                    # 靠近怪物时风险增大
-                    risk_monster = max(
-                        0.0, float(cur_monster_dist - next_monster_dist)
-                    )
+                    risk_monster = max(0.0, float(cur_monster_dist - next_monster_dist))
                     risk_monster = float(np.clip(risk_monster / 3.0, 0.0, 1.0))
 
-            # risk_dead_end
+            # risk_dead_end / benefit_openness
             risk_dead_end = 0.0
             benefit_openness = 0.0
             if next_r is not None and next_c is not None:
@@ -1495,7 +2013,7 @@ class Preprocessor:
                 risk_dead_end = 1.0 if self._is_local_dead_end(local_map) else 0.0
                 benefit_openness = self._count_free_neighbors(map_info, next_r, next_c, radius=1)
 
-            # benefit_treasure：更接近宝箱则更高
+            # benefit_treasure
             benefit_treasure = 0.0
             if cur_treasure_dist is not None and next_treasure_dist is not None:
                 delta = float(cur_treasure_dist - next_treasure_dist)
@@ -1568,7 +2086,7 @@ class Preprocessor:
         cur_buff_dist, _, _ = self._nearest_known_target_distance(
             hero_pos, buff_targets, map_info, target_sub_type=2
         )
-        cur_monster_dist, _, monster_dist_mode = self._nearest_known_monster_distance(
+        cur_monster_dist, nearest_monster_obj, monster_dist_mode = self._nearest_known_monster_distance(
             hero_pos,
             monsters,
             map_info,
@@ -1592,13 +2110,32 @@ class Preprocessor:
         self.prev_nearest_buff_path_dist = cur_buff_dist
 
         if self._is_stage_enabled("monster_dist_shaping"):
-            if self.prev_nearest_monster_path_dist is not None and cur_monster_dist is not None:
-                # 远离怪物：正；靠近怪物：负
-                delta = float(cur_monster_dist - self.prev_nearest_monster_path_dist)
-                reward_terms["monster_dist_shaping"] = float(
-                    self._cfg("monster_dist_shaping", "coef", 0.12)
-                ) * _clip_delta(delta)
+            coef = float(self._cfg("monster_dist_shaping", "coef", 0.12))
 
+            # A. 有可靠距离时，继续用距离 shaping
+            if self.prev_nearest_monster_path_dist is not None and cur_monster_dist is not None:
+                delta = float(cur_monster_dist - self.prev_nearest_monster_path_dist)
+                reward_terms["monster_dist_shaping"] = coef * _clip_delta(delta)
+
+            # B. 视野外只有方向时，只给“背离怪物方向”的奖励
+            elif monster_dist_mode == "out_of_view_direction_only":
+                escape_bonus = self._compute_out_of_view_escape_bonus(
+                    self.prev_hero_pos,
+                    hero_pos,
+                    nearest_monster_obj,
+                )
+                reward_terms["monster_dist_shaping"] = 0.5 * coef * float(escape_bonus)
+
+            # C. 视野外方向+距离都可靠时：距离 shaping + 方向 bonus
+            elif monster_dist_mode == "out_of_view_hint":
+                escape_bonus = self._compute_out_of_view_escape_bonus(
+                    self.prev_hero_pos,
+                    hero_pos,
+                    nearest_monster_obj,
+                )
+                reward_terms["monster_dist_shaping"] += 0.5 * coef * float(escape_bonus)
+
+        # 只有在当前距离真的可用时，才更新 prev
         if cur_monster_dist is not None:
             self.prev_nearest_monster_path_dist = cur_monster_dist
 
@@ -1620,20 +2157,58 @@ class Preprocessor:
 
         # 5) 撞墙 / 无效移动惩罚
         if self._is_stage_enabled("wall_collision_penalty") and last_action is not None and 0 <= int(last_action) < 8:
-            if legal_action and int(legal_action[int(last_action)]) == 0:
-                reward_terms["wall_collision_penalty"] = float(
-                    self._cfg("wall_collision_penalty", "coef", -0.05)
-                )
-            elif self.prev_hero_pos is not None:
+            prev_mask_val = None
+            if (
+                self.prev_legal_action_for_last_action is not None
+                and int(last_action) < len(self.prev_legal_action_for_last_action)
+            ):
+                prev_mask_val = int(self.prev_legal_action_for_last_action[int(last_action)])
+            
+            prev_sim_target = None
+            if (
+                self.prev_simulated_next_positions is not None
+                and 0 <= int(last_action) < len(self.prev_simulated_next_positions)
+            ):
+                prev_sim_target = self.prev_simulated_next_positions[int(last_action)]
+            
+            moved = None
+            if self.prev_hero_pos is not None:
                 moved = (
                     int(hero_pos["x"]) != int(self.prev_hero_pos["x"]) or
                     int(hero_pos["z"]) != int(self.prev_hero_pos["z"])
                 )
+
+            print(
+                "[wall_penalty_debug_fixed]",
+                "step=", self.step_count,
+                "last_action=", last_action,
+                "prev_mask_val=", prev_mask_val,
+                "prev_sim_target=", prev_sim_target,
+                "prev_hero_pos=", self.prev_hero_pos,
+                "hero_pos=", hero_pos,
+                "moved=", moved,
+            )
+            if prev_mask_val == 1 and moved is False:
+                self._debug_stuck_move_case(
+                    prev_hero_pos=self.prev_hero_pos,
+                    last_action=int(last_action),
+                    prev_sim_target=prev_sim_target,
+                    prev_map_info=self.prev_map_info_debug,
+                )
+
+            # A. 上一步动作在“上一步 mask”里就非法
+            if prev_mask_val == 0:
+                reward_terms["wall_collision_penalty"] = float(
+                    self._cfg("wall_collision_penalty", "coef", -0.05)
+                )
+
+            # B. 上一步动作虽合法，但执行后没动
+            elif self.prev_hero_pos is not None:
                 if not moved:
                     reward_terms["wall_collision_penalty"] = float(
                         self._cfg("wall_collision_penalty", "coef", -0.05)
                     )
-                self.prev_move_succeeded = moved
+                self.prev_move_succeeded = bool(moved)
 
         # 6) 开图奖励
         if self._is_stage_enabled("exploration_reward") and new_explored_cells > 0:
@@ -1657,6 +2232,84 @@ class Preprocessor:
         self.last_reward_info = reward_terms
         return np.array([total_reward], dtype=np.float32)
 
+    def _debug_stuck_move_case(
+        self,
+        prev_hero_pos: Dict[str, int],
+        last_action: int,
+        prev_sim_target: Optional[Dict[str, Any]],
+        prev_map_info: Optional[List[List[int]]],
+    ) -> None:
+        if prev_map_info is None or prev_sim_target is None:
+            print("[stuck_case_debug] prev_map_info or prev_sim_target is None")
+            return
+
+        arr = np.array(prev_map_info, dtype=np.int32)
+        if arr.ndim != 2 or arr.size == 0:
+            print("[stuck_case_debug] invalid prev_map_info")
+            return
+
+        rows, cols = arr.shape
+        cr, cc = rows // 2, cols // 2
+
+        # 与 _simulate_next_position 保持一致
+        action_delta = [
+            (1, 0),    # 0 E
+            (1, -1),   # 1 NE
+            (0, -1),   # 2 N
+            (-1, -1),  # 3 NW
+            (-1, 0),   # 4 W
+            (-1, 1),   # 5 SW
+            (0, 1),    # 6 S
+            (1, 1),    # 7 SE
+        ]
+        dx, dz = action_delta[int(last_action)]
+        tr, tc = cr + dz, cc + dx
+
+        info = {
+            "center_rc": (cr, cc),
+            "target_rc": (tr, tc),
+            "center_cell": None,
+            "target_cell": None,
+            "side1_rc": None,
+            "side1_cell": None,
+            "side2_rc": None,
+            "side2_cell": None,
+            "patch_5x5": None,
+        }
+
+        def get_cell(r, c):
+            if 0 <= r < rows and 0 <= c < cols:
+                return int(arr[r, c])
+            return "OOB"
+
+        info["center_cell"] = get_cell(cr, cc)
+        info["target_cell"] = get_cell(tr, tc)
+
+        # 对角动作时，把两侧切角格也打印出来
+        if dx != 0 and dz != 0:
+            side1 = (cr + dz, cc)
+            side2 = (cr, cc + dx)
+            info["side1_rc"] = side1
+            info["side1_cell"] = get_cell(*side1)
+            info["side2_rc"] = side2
+            info["side2_cell"] = get_cell(*side2)
+
+        patch = []
+        for r in range(cr - 2, cr + 3):
+            row = []
+            for c in range(cc - 2, cc + 3):
+                row.append(get_cell(r, c))
+            patch.append(row)
+        info["patch_5x5"] = patch
+
+        print(
+            "[stuck_case_debug]",
+            "prev_hero_pos=", prev_hero_pos,
+            "last_action=", last_action,
+            "prev_sim_target=", prev_sim_target,
+            "local_info=", info,
+        )
+
     # ---------------------------------------------------------------------
     # 主入口
     # ---------------------------------------------------------------------
@@ -1674,8 +2327,17 @@ class Preprocessor:
         organs = self._extract_organs(env_obs)
         map_info = self._extract_map_info(env_obs)
         terminated, truncated = self._extract_done_flags(env_obs)
-
         hero_pos = self._hero_pos(hero)
+
+        print(
+            "[debug parse]",
+            "hero_pos=", hero_pos,
+            "monster_num=", len(monsters),
+            "has_map=", map_info is not None,
+            "map_shape=", None if map_info is None else (len(map_info), len(map_info[0]) if len(map_info) > 0 else 0),
+        )
+
+        self._debug_print_out_of_view_monsters(hero_pos, monsters, map_info, every_n_steps=20)
 
         # 1) 更新 episode 地图记忆
         new_explored_cells = self._update_explored_map(hero_pos, map_info)
@@ -1703,13 +2365,20 @@ class Preprocessor:
         for m in monsters:
             pos = m.get("pos", {})
             mx, mz = _safe_int(pos.get("x", 0)), _safe_int(pos.get("z", 0))
-            if not self._is_valid_global(mx, mz):
-                continue
-            if mx == 0 and mz == 0:
-                continue
-            dist_info = self.compute_path_distance(hero_pos, {"x": mx, "z": mz}, map_info)
+
+            target_pos = None
+            if self._is_valid_global(mx, mz) and not (mx == 0 and mz == 0):
+                target_pos = {"x": mx, "z": mz}
+
+            dist_info = self.compute_monster_distance(
+                start_pos=hero_pos,
+                target_pos=target_pos,
+                map_info=map_info,
+                monster=m,
+            )
             if dist_info["distance"] is None:
                 continue
+
             monster_candidates.append((int(dist_info["distance"]), m))
         monster_candidates.sort(key=lambda x: x[0])
         top_monsters = [m for _, m in monster_candidates[:2]]
@@ -1751,6 +2420,30 @@ class Preprocessor:
         move_mask = self._preprocess_move_action_mask(map_info, has_speed_buff)
         flash_mask = self._preprocess_flash_action_mask(map_info, self._flash_cd_norm(hero, env_info))
         legal_action = list(move_mask) + list(flash_mask)
+
+        simulated_next_positions = []
+        for a in range(8):
+            sim_next_pos, sim_r, sim_c = self._simulate_next_position(hero_pos, map_info, a, has_speed_buff)
+            simulated_next_positions.append(
+                {
+                    "action": a,
+                    "mask": int(move_mask[a]),
+                    "next_pos": dict(sim_next_pos),
+                    "next_r": sim_r,
+                    "next_c": sim_c,
+                }
+            )
+
+        print(
+            "[mask_debug_current]",
+            "step=", self.step_count,
+            "hero_pos=", hero_pos,
+            "last_action=", last_action,
+            "move_mask=", move_mask,
+            "flash_mask=", flash_mask,
+            "legal_action=", legal_action,
+            "simulated_next_positions=", simulated_next_positions,
+        )
 
         # 9) 候选动作特征与软风险收益
         candidate_action_feat = self._build_candidate_action_features(
@@ -1799,6 +2492,12 @@ class Preprocessor:
             terminated=terminated,
             truncated=truncated,
         )
-
+        self.prev_move_mask_for_last_action = list(move_mask)
+        self.prev_flash_mask_for_last_action = list(flash_mask)
+        self.prev_legal_action_for_last_action = list(legal_action)
+        self.prev_legal_action_for_last_action = list(legal_action)
+        self.prev_simulated_next_positions = copy.deepcopy(simulated_next_positions)
+        self.prev_move_mask_debug = list(move_mask)
+        self.prev_map_info_debug = copy.deepcopy(map_info)
         self.step_count += 1
         return feature, legal_action, reward
