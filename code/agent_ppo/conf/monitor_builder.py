@@ -48,6 +48,7 @@ def build_monitor():
         ("生存奖励", "survive_reward"),
         ("宝箱分奖励", "treasure_reward"),
         ("Buff奖励", "speed_buff_reward"),
+        ("Buff有还拿惩罚","buff_overlap_penalty"),
         ("Buff靠近奖励", "speed_buff_approach_reward"),
         ("宝箱接近奖励", "treasure_approach_reward"),
         ("怪物距离Shaping", "monster_dist_shaping"),
@@ -69,6 +70,7 @@ def build_monitor():
         ("无移动次数", "no_movement_case"),
         ("MoveMask一致率", "move_mask_consistency_rate"),
         ("开图率", "explore_rate"),
+        ("该闪不闪惩罚","flash_hold_penalty")
     ]
     for panel_name, metric_name in reward_panels:
         monitor.add_panel(name=panel_name, name_en=metric_name, type="line")

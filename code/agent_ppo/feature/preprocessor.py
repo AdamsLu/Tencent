@@ -658,6 +658,16 @@ class Preprocessor:
                 "centroid_norm_max": MAP_SIZE * 0.5,
                 "visit_cell_size": 4,
                 "treasure_detect_radius": 5.0,
+                "flash_danger_margin": 0.1,
+                "flash_escape_topk_dirs_danger": 2,
+                "flash_escape_topk_dirs_safe": 1,
+                # 意在增加闪现动作频次，只不过是通过加权
+                "flash_sample_reweight_enable": True,
+                "flash_sample_reweight_base": 1.0,
+                "flash_sample_reweight_danger": 1.3,          # 危险窗口样本权重
+                "flash_sample_reweight_post_flash": 1.5,      # 闪现后窗口样本权重
+                "flash_sample_reweight_post_flash_steps": 12, # 闪现后多少步内加权
+                "flash_sample_reweight_max": 2.0,             # 权重上限，防止过大
             },
             "survive_reward": {"enable": True, "coef": 0.1},
             "treasure_reward": {
@@ -673,6 +683,11 @@ class Preprocessor:
                 "second_monster_spawn_mult": 1.0,
                 "first_monster_speedup_mult": 1.0,
                 "second_monster_speedup_mult": 1.0,
+            },
+            "buff_overlap_penalty": {
+                "enable": True,
+                "coef": -0.1,          # 持有buff时再次拾取，每个buff的惩罚系数
+                "apply_only_train": True,  # 仅训练期生效，避免评估指标被“策略约束项”干扰
             },
             "speed_buff_approach_reward": {
                 "enable": True,
@@ -704,6 +719,13 @@ class Preprocessor:
             "danger_penalty": {"enable": True, "coef": -0.1, "power": 2.0},
             "wall_collision_penalty": {"enable": True, "coef": -0.1},
             "flash_fail_penalty": {"enable": True, "coef": -0.15},
+            "flash_hold_penalty": {
+                "enable": True,
+                "coef": -0.03,                 # 轻惩罚
+                "min_monster_dist_margin": 0.0,# 可选安全余量
+                "require_flash_ready": True,   # 要求CD好
+                "apply_only_train": True,      # 仅训练期生效（推荐）
+            },
             "flash_escape_reward": {
                 "enable": True,
                 "base": 1.0,
@@ -861,6 +883,8 @@ class Preprocessor:
         # ========== 闪现失败检测状态 ==========
         # 上一帧使用的闪现动作ID（用于计算期望闪现距离）
         self.last_flash_action = -1
+        # ========== 闪现样本重加权状态 ==========
+        self.flash_post_window_steps_left = 0
 
         # ========== 最近怪物追踪状态 ==========
         # 上一帧最近怪物的序号（0或1），-1 表示无怪物
@@ -891,8 +915,8 @@ class Preprocessor:
 
         # ========== 地图记忆 / 开图奖励状态 ==========
         # 单张全局地图（128x128）：按用户约束初始化为全1（默认完全可通行）。
-        # 当局部观测到障碍时写0；观测到可通行时写1。
-        self.global_map = np.ones((GLOBAL_MAP_SIZE, GLOBAL_MAP_SIZE), dtype=np.float32)
+        # -1=未知, 0=障碍, 1=可通行
+        self.global_map = np.full((GLOBAL_MAP_SIZE, GLOBAL_MAP_SIZE), -1.0, dtype=np.float32)
         # 已观测坐标集合：用于统计开图奖励（首次观测到的新格子数）。
         self.observed_cells = set()
         # 上一帧已探索格子总数（用于计算新增开图数）
@@ -1467,82 +1491,154 @@ class Preprocessor:
             return False
         return int(map_info[rr][cc]) != 0
 
+    def _find_flash_landing_from_far_to_near(self, hero_pos, flash_action_idx, map_info):
+        """Simulate env flash landing: scan from far to near, return first passable cell."""
+        hx = float(hero_pos["x"])
+        hz = float(hero_pos["z"])
+        dx, dz, expected_dist = self._flash_action_to_delta(flash_action_idx)
+
+        max_step = int(round(expected_dist))
+        max_step = max(1, max_step)
+
+        for s in range(max_step, 0, -1):
+            tx = hx + dx * s
+            tz = hz + dz * s
+            if self._is_flash_target_passable(tx, tz, hero_pos, map_info):
+                return {"x": float(tx), "z": float(tz)}, float(s)
+
+        return None, 0.0
+
     def _preprocess_flash_action_mask(self, legal_action, monsters, hero_pos, map_info):
-        """Flash-mask policy:
-        - 始终考虑穿墙闪现（不论是否在死角）
-        - 平地：优先反向远离怪物
-        - 死角：优先闪到怪物身后
+        """Flash mask policy (updated by design constraints):
+        1) 平地闪现：仅危险时可用（动态危险半径）
+        2) 穿墙闪现：不论危险与否都可考虑，但需满足沿路对怪物距离增大或怪物不可见
+        3) 落点非必须最远可通行：按“最远->最近”找首个可通行落点
+        4) 允许全0，不强制回填
         """
         nearest_monster_pos, nearest_monster_dist = self._infer_nearest_monster_pos(monsters, hero_pos)
-        if nearest_monster_pos is None:
-            return legal_action
 
-        danger_dist_cells = float(self._global_cfg("flash_danger_dist_cells", 5.0))
-        if nearest_monster_dist > danger_dist_cells:
-            return legal_action
+        # 没怪物：仅保留“穿墙且收益正”的候选；否则可全0
+        has_visible_monster = nearest_monster_pos is not None
 
         flash_base = [int(x) for x in legal_action[8:16]]
         if sum(flash_base) == 0:
             return legal_action
 
-        hx = float(hero_pos["x"])
-        hz = float(hero_pos["z"])
-        mx = float(nearest_monster_pos["x"])
-        mz = float(nearest_monster_pos["z"])
+        # 动态危险半径：> 2 + monster_speed（实际速度）
+        monster_speed_actual = 0.0
+        if has_visible_monster:
+            # 找到最近怪物对应speed
+            hx = float(hero_pos["x"])
+            hz = float(hero_pos["z"])
+            best_d = float("inf")
+            for m in monsters or []:
+                if not isinstance(m, dict):
+                    continue
+                pos = m.get("pos", None)
+                if (not isinstance(pos, dict)) or self._is_sentinel_pos(pos):
+                    continue
+                mx, mz = float(pos.get("x", 0.0)), float(pos.get("z", 0.0))
+                d = float(np.hypot(mx - hx, mz - hz))
+                if d < best_d:
+                    best_d = d
+                    monster_speed_actual = float(m.get("speed", 0.0))
+
+        danger_margin = float(self._global_cfg("flash_danger_margin", 0.1))
+        danger_dist_cells = 2.0 + float(monster_speed_actual) + danger_margin
+        in_danger = bool(has_visible_monster and nearest_monster_dist <= danger_dist_cells)
 
         in_dead_end = bool(getattr(self, "dead_end_active", False))
-        topk = int(self._global_cfg("flash_escape_topk_dirs", 2))
-        topk = max(1, min(8, topk))
+        topk_danger = int(self._global_cfg("flash_escape_topk_dirs_danger", 2))
+        topk_safe = int(self._global_cfg("flash_escape_topk_dirs_safe", 1))
+        topk_danger = max(1, min(8, topk_danger))
+        topk_safe = max(1, min(8, topk_safe))
 
-        # 怪物方向单位向量（hero -> monster）
-        vx = mx - hx
-        vz = mz - hz
-        v_norm = float(np.hypot(vx, vz))
-        ux, uz = (vx / v_norm, vz / v_norm) if v_norm > 1e-6 else (0.0, 0.0)
+        hx = float(hero_pos["x"])
+        hz = float(hero_pos["z"])
 
-        score_list = []  # (score, dir_idx0_7)
+        if has_visible_monster:
+            mx = float(nearest_monster_pos["x"])
+            mz = float(nearest_monster_pos["z"])
+            pre_dist = float(np.hypot(hx - mx, hz - mz))
+            vx = mx - hx
+            vz = mz - hz
+            v_norm = float(np.hypot(vx, vz))
+            ux, uz = (vx / v_norm, vz / v_norm) if v_norm > 1e-6 else (0.0, 0.0)
+        else:
+            mx = mz = 0.0
+            pre_dist = 0.0
+            ux = uz = 0.0
+
+        score_list = []  # (score, dir_idx)
         for dir_idx in range(8):
             if flash_base[dir_idx] == 0:
                 continue
 
             action_idx = 8 + dir_idx
-            dx, dz, step_len = self._flash_action_to_delta(action_idx)
-            tx = hx + dx * step_len
-            tz = hz + dz * step_len
 
-            if not self._is_flash_target_passable(tx, tz, hero_pos, map_info):
+            # 新落点机制：从最远到最近找首个可通行格
+            landing, landing_step = self._find_flash_landing_from_far_to_near(hero_pos, action_idx, map_info)
+            if landing is None:
+                # 完全无可落点
                 continue
 
+            tx, tz = float(landing["x"]), float(landing["z"])
             cross_wall = self._sample_line_has_block(hx, hz, tx, tz, map_info)
 
-            # 公共项：闪后与怪物距离（越大越好）
-            dist_after = float(np.hypot(tx - mx, tz - mz))
-
-            if in_dead_end:
-                # 死角：优先“怪物身后”
-                ideal_x = mx + ux * (step_len * 0.5)
-                ideal_z = mz + uz * (step_len * 0.5)
-                behind_score = -float(np.hypot(tx - ideal_x, tz - ideal_z))
-                score = 2.0 * behind_score + 0.4 * dist_after + (3.0 if cross_wall else 0.0)
+            # 要点二：穿墙闪现的收益条件
+            # 条件A：怪物不可见（可接受）
+            # 条件B：怪物可见时，闪后与怪物距离 > 闪前
+            if has_visible_monster:
+                post_dist = float(np.hypot(tx - mx, tz - mz))
+                path_gain_ok = bool(post_dist > pre_dist + 1e-6)
             else:
-                # 平地：优先反方向远离怪物
-                away_align = float((tx - hx) * (-ux) + (tz - hz) * (-uz))  # 与“远离怪物方向”对齐
-                score = 1.2 * dist_after + 1.2 * away_align + (2.0 if cross_wall else 0.0)
+                post_dist = 0.0
+                path_gain_ok = True
+
+            cross_wall_and_gain_ok = bool(cross_wall and path_gain_ok)
+
+            # 平地非危险：不鼓励普通闪现，仅允许“穿墙且收益正”
+            if not in_danger:
+                if not cross_wall_and_gain_ok:
+                    continue
+                score = 10.0 + float(landing_step)  # 远一点通常更好，但不强求最远
+                score_list.append((score, dir_idx))
+                continue
+
+            # 危险期：允许闪现，但仍优先“穿墙且拉开距离”
+            if in_dead_end:
+                ideal_x = mx + ux * max(1.0, landing_step * 0.5)
+                ideal_z = mz + uz * max(1.0, landing_step * 0.5)
+                behind_score = -float(np.hypot(tx - ideal_x, tz - ideal_z))
+                score = (
+                    2.0 * behind_score
+                    + 0.8 * (post_dist - pre_dist)
+                    + (3.0 if cross_wall else 0.0)
+                    + 0.2 * float(landing_step)
+                )
+            else:
+                away_align = float((tx - hx) * (-ux) + (tz - hz) * (-uz))
+                score = (
+                    1.2 * (post_dist - pre_dist)
+                    + 1.2 * away_align
+                    + (2.0 if cross_wall else 0.0)
+                    + 0.2 * float(landing_step)
+                )
+
+            # 危险期也要求“至少不更差”
+            if has_visible_monster and (post_dist <= pre_dist + 1e-6) and (not cross_wall):
+                continue
 
             score_list.append((score, dir_idx))
 
-        if not score_list:
-            return legal_action
-
-        score_list.sort(key=lambda x: x[0], reverse=True)
-        keep_dirs = set([d for _, d in score_list[:topk]])
-
+        # 允许全0（要点四）
         new_flash = [0] * 8
-        for d in keep_dirs:
-            new_flash[d] = 1
-
-        if sum(new_flash) == 0:
-            new_flash = flash_base
+        if score_list:
+            score_list.sort(key=lambda x: x[0], reverse=True)
+            k = topk_danger if in_danger else topk_safe
+            keep_dirs = set([d for _, d in score_list[:k]])
+            for d in keep_dirs:
+                new_flash[d] = 1
 
         for i in range(8):
             legal_action[8 + i] = int(new_flash[i])
@@ -2247,6 +2343,13 @@ class Preprocessor:
 
         # 判断当前是否使用了闪现动作（动作8-15为闪现）
         cur_used_flash = 8 <= last_action <= 15
+        # 更新“闪现后窗口”计数（用于样本重加权）
+        if cur_used_flash:
+            self.flash_post_window_steps_left = int(
+                self._global_cfg("flash_sample_reweight_post_flash_steps", 12)
+            )
+        elif self.flash_post_window_steps_left > 0:
+            self.flash_post_window_steps_left -= 1
 
         # 获取怪物速度信息（用于判断是否进入加速阶段）
         monster_speed = env_info.get("monster_speed", 1)
@@ -2312,6 +2415,17 @@ class Preprocessor:
         if buff_delta > 0:
             self._release_nearest_memory_slots(2, hero_pos, buff_delta)
         self._update_treasure_circle_stats(hero_pos, treasure_collected_delta)
+
+        # 3.5 【稀疏】buff重叠惩罚 —— 已持有加速buff时再次拾取buff，给予轻惩罚
+        # 目的：让智能体学会“身上有buff时，优先做别的事（逃生/拿宝箱）”
+        buff_overlap_penalty = 0.0
+        if self._cfg("buff_overlap_penalty", "enable", True) and buff_delta > 0:
+            # apply_only_train=True 时，仅训练模式生效
+            if (not bool(self._cfg("buff_overlap_penalty", "apply_only_train", True))) or (
+                self.episode_mode != "eval"
+            ):
+                if bool(self.last_had_speed_buff):
+                    buff_overlap_penalty = float(self._cfg("buff_overlap_penalty", "coef", -0.1)) * float(buff_delta)
 
         # 4. 【稠密】加速buff靠近奖励 —— 仅计算最近加速buff，接近时给正向奖励
         speed_buff_approach_reward = 0.0
@@ -2445,6 +2559,22 @@ class Preprocessor:
             if flash_displacement < expected_dist * float(self._global_cfg("flash_fail_ratio", 0.3)):
                 flash_fail_penalty = float(self._cfg("flash_fail_penalty", "coef", -0.15))
                 flash_fail_triggered = True
+
+        # 10.5 【稀疏/轻惩罚】该闪未闪惩罚
+        # 条件：处于危险窗口 + 闪现CD就绪 + 本步未闪现
+        flash_hold_penalty = 0.0
+        if self._cfg("flash_hold_penalty", "enable", True):
+            # 训练期控制：eval 不施加，避免污染评估
+            if (not bool(self._cfg("flash_hold_penalty", "apply_only_train", True))) or (self.episode_mode != "eval"):
+                flash_ready = bool(hero.get("flash_cooldown", 1) <= 0) if bool(
+                    self._cfg("flash_hold_penalty", "require_flash_ready", True)
+                ) else True
+
+                # 用你已有危险判据：danger_penalty < 0 等价“已进入危险阈值”
+                in_danger_now = bool(danger_penalty < 0)
+
+                if in_danger_now and flash_ready and (not cur_used_flash):
+                    flash_hold_penalty = float(self._cfg("flash_hold_penalty", "coef", -0.03))
 
         # 记录上一决策动作与执行结果，用于分析合法动作掩码是否有效。
         no_movement_case = 0.0
@@ -2736,6 +2866,7 @@ class Preprocessor:
             survive_reward +
             treasure_reward +
             speed_buff_reward +
+            buff_overlap_penalty +
             speed_buff_approach_reward +
             treasure_approach_reward +
             monster_dist_shaping +
@@ -2752,8 +2883,30 @@ class Preprocessor:
             exploration_reward +
             visit_tracking_reward +
             centroid_away_reward +
-            idle_wander_penalty
+            idle_wander_penalty +
+            flash_hold_penalty
         )
+        # ====== 训练样本重加权（reward-scale 等效）======
+        sample_weight = 1.0
+        if bool(self._global_cfg("flash_sample_reweight_enable", True)):
+            base_w = float(self._global_cfg("flash_sample_reweight_base", 1.0))
+            danger_w = float(self._global_cfg("flash_sample_reweight_danger", 1.3))
+            post_w = float(self._global_cfg("flash_sample_reweight_post_flash", 1.5))
+            max_w = float(self._global_cfg("flash_sample_reweight_max", 2.0))
+
+            sample_weight = base_w
+
+            # 危险窗口加权：复用你当前动态危险定义（若上文已有 in_danger 可直接用）
+            # 这里直接用 danger_penalty 是否触发作为近似危险判据，低侵入。
+            if danger_penalty < 0:
+                sample_weight = max(sample_weight, danger_w)
+
+            # 闪现后若干步加权
+            if self.flash_post_window_steps_left > 0:
+                sample_weight = max(sample_weight, post_w)
+
+            sample_weight = float(np.clip(sample_weight, 1.0, max_w))
+            total_reward *= sample_weight
 
         # ========== 更新历史状态（供下一帧使用）==========
         self.last_min_monster_dist_norm = cur_min_monster_dist_norm
@@ -2783,6 +2936,7 @@ class Preprocessor:
             "treasure_reward": treasure_reward,
             "treasure_collected_delta": float(treasure_collected_delta),
             "speed_buff_reward": speed_buff_reward,
+            "buff_overlap_penalty": buff_overlap_penalty,
             "speed_buff_approach_reward": speed_buff_approach_reward,
             "treasure_approach_reward": treasure_approach_reward,
             "treasure_memory_slots": float(len(treasure_dist_norms)),
@@ -2840,6 +2994,9 @@ class Preprocessor:
             "total_reward": total_reward,
             "explored_cell_count": float(len(self.observed_cells)),
             "explore_rate": float(len(self.observed_cells)) / 16384.0,
+            "sample_weight": float(sample_weight),
+            "flash_post_window_steps_left": float(self.flash_post_window_steps_left),
+            "flash_hold_penalty": flash_hold_penalty,
         }
 
         # 更新已探索格子计数
@@ -2887,9 +3044,129 @@ class Preprocessor:
             return True
         return map_info[rr][cc] != 0
 
+    def _is_cell_passable_from_global(self, x, z):
+        """Global map passability query: 1 passable, 0 blocked, -1 unknown."""
+        if not (0 <= int(x) < GLOBAL_MAP_SIZE and 0 <= int(z) < GLOBAL_MAP_SIZE):
+            return False
+        v = int(self.global_map[int(z), int(x)])
+        return v == 1
+
+    def _astar_path_distance_8dir(self, start_xy, goal_xy, allow_unknown=False, max_expand=4000):
+        """A* shortest path distance on 8-neighborhood, unit step cost=1."""
+        sx, sz = int(start_xy[0]), int(start_xy[1])
+        gx, gz = int(goal_xy[0]), int(goal_xy[1])
+
+        if (sx, sz) == (gx, gz):
+            return 0.0, True
+
+        import heapq
+
+        def in_bounds(x, z):
+            return 0 <= x < GLOBAL_MAP_SIZE and 0 <= z < GLOBAL_MAP_SIZE
+
+        def passable(x, z):
+            if not in_bounds(x, z):
+                return False
+            v = int(self.global_map[z, x])
+            if v == 1:
+                return True
+            if v == -1 and allow_unknown:
+                return True
+            return False
+
+        def h(x, z):
+            # Chebyshev for 8-dir, consistent with unit step
+            return float(max(abs(x - gx), abs(z - gz)))
+
+        dirs8 = [(1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1)]
+
+        open_heap = []
+        heapq.heappush(open_heap, (h(sx, sz), 0.0, sx, sz))
+        g_score = {(sx, sz): 0.0}
+        closed = set()
+        expanded = 0
+
+        while open_heap and expanded < int(max_expand):
+            _, g, x, z = heapq.heappop(open_heap)
+            if (x, z) in closed:
+                continue
+            closed.add((x, z))
+            expanded += 1
+
+            if (x, z) == (gx, gz):
+                return float(g), True
+
+            for dx, dz in dirs8:
+                nx, nz = x + dx, z + dz
+                if not passable(nx, nz):
+                    continue
+                ng = g + 1.0
+                if ng < g_score.get((nx, nz), float("inf")):
+                    g_score[(nx, nz)] = ng
+                    heapq.heappush(open_heap, (ng + h(nx, nz), ng, nx, nz))
+
+        return float("inf"), False
+
+    def _query_target_path_distance(self, hero_pos, target_entity, target_name="target"):
+        """Unified target distance query with 3 cases:
+        1) target in 21x21 view -> direct A*
+        2) target in explored global map memory -> A*
+        3) target unknown -> return (None, direction_bin, distance_bin)
+        """
+        hx, hz = int(hero_pos["x"]), int(hero_pos["z"])
+
+        # Case 3 fallback from protocol bins
+        if (target_entity is None) or (not isinstance(target_entity, dict)):
+            return {
+                "path_dist": None,
+                "reachable": False,
+                "source": "protocol_bin",
+                "direction_bin": None,
+                "distance_bin": None,
+                "target_name": target_name,
+            }
+
+        pos = target_entity.get("pos", None)
+        in_view = self._resolve_entity_in_view(target_entity)
+
+        if in_view and isinstance(pos, dict) and (not self._is_sentinel_pos(pos)):
+            tx, tz = int(pos["x"]), int(pos["z"])
+            d, ok = self._astar_path_distance_8dir((hx, hz), (tx, tz), allow_unknown=False)
+            return {
+                "path_dist": None if not ok else float(d),
+                "reachable": bool(ok),
+                "source": "in_view_astar",
+                "direction_bin": int(self._compute_direction_id_from_pos(pos, hero_pos)),
+                "distance_bin": int(target_entity.get("hero_l2_distance", 0)),
+                "target_name": target_name,
+            }
+
+        # Case 2: from remembered/global-known target position
+        if isinstance(pos, dict) and (not self._is_sentinel_pos(pos)):
+            tx, tz = int(pos["x"]), int(pos["z"])
+            # only trust explored map; unknown does not pass
+            d, ok = self._astar_path_distance_8dir((hx, hz), (tx, tz), allow_unknown=False)
+            return {
+                "path_dist": None if not ok else float(d),
+                "reachable": bool(ok),
+                "source": "memory_astar",
+                "direction_bin": int(self._compute_direction_id_from_pos(pos, hero_pos)),
+                "distance_bin": int(target_entity.get("hero_l2_distance", 0)),
+                "target_name": target_name,
+            }
+
+        # Case 3: unknown target
+        return {
+            "path_dist": None,
+            "reachable": False,
+            "source": "protocol_bin",
+            "direction_bin": int(target_entity.get("hero_relative_direction", 0)),
+            "distance_bin": int(target_entity.get("hero_l2_distance", 0)),
+            "target_name": target_name,
+        }
+
     def _compute_visit_tracking_reward(self, hero_pos, map_info):
         """Cell-based visit tracking.
-
         将 128x128 地图按 cell_size 切分为若干 cell，当前坐标落入的 cell 首次访问给首访奖励，
         第二次访问给二访奖励，之后不再奖励。
         """
@@ -2897,25 +3174,21 @@ class Preprocessor:
         hz = int(hero_pos.get("z", -1))
         if not (0 <= hx < GLOBAL_MAP_SIZE and 0 <= hz < GLOBAL_MAP_SIZE):
             return 0.0, 0.0
-
         cell_size = max(1, int(self._global_cfg("visit_cell_size", 4)))
         cell_x = min(VISIT_TRACK_COLS - 1, hx // cell_size)
         cell_z = min(VISIT_TRACK_ROWS - 1, hz // cell_size)
-
         prev_count = int(self.visit_count_map[cell_z, cell_x])
         if prev_count < 255:
             self.visit_count_map[cell_z, cell_x] = min(prev_count + 1, 255)
         cur_count = int(self.visit_count_map[cell_z, cell_x])
-
         if not self._cfg("visit_tracking_reward", "enable", True):
             return 0.0, float(cur_count)
-
         if prev_count == 0:
             return float(self._cfg("visit_tracking_reward", "first_visit", 0.5)), float(cur_count)
         if prev_count == 1:
             return float(self._cfg("visit_tracking_reward", "second_visit", 0.25)), float(cur_count)
         return 0.0, float(cur_count)
-
+    
     def _update_explored_map(self, hero_pos, map_info):
         """Update global explored map with current local FOV.
 
@@ -2955,7 +3228,7 @@ class Preprocessor:
                     if key not in self.observed_cells:
                         self.observed_cells.add(key)
                         new_count += 1
-                    self.global_map[global_z, global_x] = 1.0 if map_info[r][c] != 0 else 0.0
+                    self.global_map[global_z, global_x] = 1.0 if int(map_info[r][c]) != 0 else 0.0
 
         return new_count
 
