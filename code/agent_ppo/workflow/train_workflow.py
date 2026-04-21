@@ -280,7 +280,19 @@ class EpisodeRunner:
             )
 
             while not done:
-                act_data = self.agent.predict(list_obs_data=[obs_data])[0]
+                # act_data = self.agent.predict(list_obs_data=[obs_data])[0]
+                pred = self.agent.predict(list_obs_data=[obs_data])
+                
+                if pred is None:
+                    raise RuntimeError("agent.predict returned None")
+
+                if not isinstance(pred, (list, tuple)):
+                    raise RuntimeError(f"agent.predict invalid type: {type(pred)}")
+
+                if len(pred) == 0:
+                    raise RuntimeError("agent.predict returned empty list")
+
+                act_data = pred[0]
                 act = self.agent.action_process(act_data)
 
                 env_reward, env_obs = self.env.step(act)

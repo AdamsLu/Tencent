@@ -85,29 +85,39 @@ class Agent(BaseAgent):
         return obs_data, remain_info
 
     def predict(self, list_obs_data, list_state=None):
-        """Stochastic inference for training (exploration).
-
-        训练时随机采样动作（探索）。
-        """
         list_act_data = []
-        for obs_data in list_obs_data:
-            feature = obs_data.feature
-            legal_action = obs_data.legal_action
+        for i, obs_data in enumerate(list_obs_data):
+            try:
+                feature = obs_data.feature
+                legal_action = obs_data.legal_action
 
-            _, value, prob = self._run_model(feature, legal_action)
+                out = self._run_model(feature, legal_action)
+                if out is None:
+                    raise RuntimeError(f"_run_model returned None at idx={i}")
 
-            action = self._legal_sample_with_mask(prob, legal_action, use_max=False)
-            d_action = self._legal_sample_with_mask(prob, legal_action, use_max=True)
+                _, value, prob = out
+                if prob is None:
+                    raise RuntimeError(f"prob is None at idx={i}")
 
-            list_act_data.append(
-                ActData(
-                    action=[action],
-                    d_action=[d_action],
-                    prob=list(prob),
-                    value=value,
+                action = self._legal_sample_with_mask(prob, legal_action, use_max=False)
+                d_action = self._legal_sample_with_mask(prob, legal_action, use_max=True)
+
+                list_act_data.append(
+                    ActData(
+                        action=[action],
+                        d_action=[d_action],
+                        prob=list(prob),
+                        value=value,
+                    )
                 )
-            )
-
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(
+                    f"predict failed at idx={i}, "
+                    f"feature_len={len(obs_data.feature) if obs_data and obs_data.feature is not None else 'None'}, "
+                    f"legal_len={len(obs_data.legal_action) if obs_data and obs_data.legal_action is not None else 'None'}"
+                ) from e
         return list_act_data
 
     def exploit(self, env_obs):
@@ -176,22 +186,44 @@ class Agent(BaseAgent):
         return int(action[0])
 
     def _run_model(self, feature, legal_action):
-        """Run model inference with vector input, return logits, value, prob.
-
-        执行模型推理（单输入向量模式），返回 logits、value 和动作概率。
-        """
+        """Run model inference with vector input, return logits, value, prob."""
         self.model.set_eval_mode()
-        vec_tensor = torch.tensor(np.array([feature]), dtype=torch.float32).to(self.device)
 
+        # 1) 先构造 vec_tensor
+        vec_np = np.array([feature], dtype=np.float32)
+        vec_tensor = torch.tensor(vec_np, dtype=torch.float32).to(self.device)
+
+        # 2) 再做维度校验
+        expect_dim = int(sum(self.model.feature_split_shape))
+        got_dim = int(vec_tensor.shape[1])
+        if got_dim != expect_dim:
+            raise RuntimeError(
+                f"feature dim mismatch: got={got_dim}, expect={expect_dim}, "
+                f"split={self.model.feature_split_shape}"
+            )
+
+        # 3) 前向
         with torch.no_grad():
-            logits, value = self.model(vec_tensor, inference=True)
+            try:
+                logits, value = self.model(vec_tensor, inference=True)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(
+                    f"model forward failed: input_shape={tuple(vec_tensor.shape)}, "
+                    f"split={self.model.feature_split_shape}"
+                ) from e
 
-        logits_np = logits.cpu().numpy()[0]
-        value_np = value.cpu().numpy()[0]
+        logits_np = logits.detach().cpu().numpy()[0]
+        value_np = value.detach().cpu().numpy()[0]
 
         legal_action_np = np.array(legal_action, dtype=np.float32)
-        prob = self._legal_soft_max(logits_np, legal_action_np)
+        if legal_action_np.shape[0] != logits_np.shape[0]:
+            raise RuntimeError(
+                f"legal_action length mismatch: legal={legal_action_np.shape[0]}, logits={logits_np.shape[0]}"
+            )
 
+        prob = self._legal_soft_max(logits_np, legal_action_np)
         return logits_np, value_np, prob
 
     def _legal_soft_max(self, input_hidden, legal_action):

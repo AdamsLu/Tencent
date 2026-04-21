@@ -19,8 +19,8 @@ class Config:
     #    + treasure[10]*40
     #    + speed_buff[2]*40
     #    + local_map:441(21×21，先过MLP编码)
-    #    + global_map:16384(1×128×128，单张全局图，走CNN)
-    #    + progress:2
+    #    + global_map:16384(1×128×128，单张全局图，走CNN)，删去
+    #    + progress:2->1
     FEATURES = [
         14,
         40,
@@ -38,8 +38,7 @@ class Config:
         40,
         40,
         441,
-        16384,
-        2,
+        1,
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURE_SPLIT_SHAPE)

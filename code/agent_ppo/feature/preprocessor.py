@@ -969,10 +969,10 @@ class Preprocessor:
             vel.extend([dx, dz])
         return np.array(vel, dtype=np.float32)
 
-    def _build_global_map_feature(self):
-        """Build 1x128x128 global map tensor and flatten it for model input."""
-        global_map = self.global_map[np.newaxis, ...].astype(np.float32)
-        return global_map.reshape(-1)
+    # def _build_global_map_feature(self):
+    #     """Build 1x128x128 global map tensor and flatten it for model input."""
+    #     global_map = self.global_map[np.newaxis, ...].astype(np.float32)
+    #     return global_map.reshape(-1)
 
     def _build_local_map_feature(self, map_info):
         """Build local 21x21 passable map feature (no CNN)."""
@@ -1379,6 +1379,175 @@ class Preprocessor:
             mask[i] = 1 if legal else 0
 
         return mask
+
+    def _infer_nearest_monster_pos(self, monsters, hero_pos):
+        """Get nearest monster position in raw grid coords; return (None, inf) if unavailable."""
+        nearest_pos = None
+        min_dist = float("inf")
+        hx = float(hero_pos["x"])
+        hz = float(hero_pos["z"])
+
+        for m in monsters or []:
+            if not isinstance(m, dict):
+                continue
+            pos = m.get("pos", None)
+            if (not isinstance(pos, dict)) or self._is_sentinel_pos(pos):
+                continue
+            mx = float(pos.get("x", 0))
+            mz = float(pos.get("z", 0))
+            if int(mx) == 0 and int(mz) == 0 and int(m.get("is_in_view", 0)) == 0:
+                continue
+            d = float(np.hypot(mx - hx, mz - hz))
+            if d < min_dist:
+                min_dist = d
+                nearest_pos = {"x": mx, "z": mz}
+        return nearest_pos, min_dist
+
+    def _flash_action_to_delta(self, flash_action_idx):
+        """Map flash action 8..15 to (dx, dz, expected_dist)."""
+        dir_idx = int(flash_action_idx) - 8
+        dirs = [(1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1)]
+        dx, dz = dirs[max(0, min(7, dir_idx))]
+        is_diagonal = dir_idx in {1, 3, 5, 7}
+        expected_dist = float(
+            self._global_cfg(
+                "flash_expected_dist_diagonal" if is_diagonal else "flash_expected_dist_orthogonal",
+                8.0 if is_diagonal else 10.0,
+            )
+        )
+        return dx, dz, expected_dist
+
+    def _sample_line_has_block(self, x0, z0, x1, z1, map_info):
+        """Check whether segment from start to end crosses blocked cells in local map projection."""
+        if map_info is None:
+            return False
+        rows = len(map_info)
+        cols = len(map_info[0]) if rows > 0 else 0
+        if rows == 0 or cols == 0:
+            return False
+
+        hx = int(round(x0))
+        hz = int(round(z0))
+        center_r = rows // 2
+        center_c = cols // 2
+
+        def is_block(gx, gz):
+            rr = center_r + (int(round(gz)) - hz)
+            cc = center_c + (int(round(gx)) - hx)
+            if not (0 <= rr < rows and 0 <= cc < cols):
+                return True
+            return int(map_info[rr][cc]) == 0
+
+        steps = int(max(abs(x1 - x0), abs(z1 - z0)))
+        steps = max(1, steps)
+        for i in range(1, steps):
+            t = float(i) / float(steps)
+            gx = x0 + (x1 - x0) * t
+            gz = z0 + (z1 - z0) * t
+            if is_block(gx, gz):
+                return True
+        return False
+
+    def _is_flash_target_passable(self, tx, tz, hero_pos, map_info):
+        """Check flash target passability by local map projection."""
+        if map_info is None:
+            return True
+        rows = len(map_info)
+        cols = len(map_info[0]) if rows > 0 else 0
+        if rows == 0 or cols == 0:
+            return True
+
+        hx = int(hero_pos["x"])
+        hz = int(hero_pos["z"])
+        center_r = rows // 2
+        center_c = cols // 2
+        rr = center_r + (int(round(tz)) - hz)
+        cc = center_c + (int(round(tx)) - hx)
+        if not (0 <= rr < rows and 0 <= cc < cols):
+            return False
+        return int(map_info[rr][cc]) != 0
+
+    def _preprocess_flash_action_mask(self, legal_action, monsters, hero_pos, map_info):
+        """Flash-mask policy:
+        - 始终考虑穿墙闪现（不论是否在死角）
+        - 平地：优先反向远离怪物
+        - 死角：优先闪到怪物身后
+        """
+        nearest_monster_pos, nearest_monster_dist = self._infer_nearest_monster_pos(monsters, hero_pos)
+        if nearest_monster_pos is None:
+            return legal_action
+
+        danger_dist_cells = float(self._global_cfg("flash_danger_dist_cells", 5.0))
+        if nearest_monster_dist > danger_dist_cells:
+            return legal_action
+
+        flash_base = [int(x) for x in legal_action[8:16]]
+        if sum(flash_base) == 0:
+            return legal_action
+
+        hx = float(hero_pos["x"])
+        hz = float(hero_pos["z"])
+        mx = float(nearest_monster_pos["x"])
+        mz = float(nearest_monster_pos["z"])
+
+        in_dead_end = bool(getattr(self, "dead_end_active", False))
+        topk = int(self._global_cfg("flash_escape_topk_dirs", 2))
+        topk = max(1, min(8, topk))
+
+        # 怪物方向单位向量（hero -> monster）
+        vx = mx - hx
+        vz = mz - hz
+        v_norm = float(np.hypot(vx, vz))
+        ux, uz = (vx / v_norm, vz / v_norm) if v_norm > 1e-6 else (0.0, 0.0)
+
+        score_list = []  # (score, dir_idx0_7)
+        for dir_idx in range(8):
+            if flash_base[dir_idx] == 0:
+                continue
+
+            action_idx = 8 + dir_idx
+            dx, dz, step_len = self._flash_action_to_delta(action_idx)
+            tx = hx + dx * step_len
+            tz = hz + dz * step_len
+
+            if not self._is_flash_target_passable(tx, tz, hero_pos, map_info):
+                continue
+
+            cross_wall = self._sample_line_has_block(hx, hz, tx, tz, map_info)
+
+            # 公共项：闪后与怪物距离（越大越好）
+            dist_after = float(np.hypot(tx - mx, tz - mz))
+
+            if in_dead_end:
+                # 死角：优先“怪物身后”
+                ideal_x = mx + ux * (step_len * 0.5)
+                ideal_z = mz + uz * (step_len * 0.5)
+                behind_score = -float(np.hypot(tx - ideal_x, tz - ideal_z))
+                score = 2.0 * behind_score + 0.4 * dist_after + (3.0 if cross_wall else 0.0)
+            else:
+                # 平地：优先反方向远离怪物
+                away_align = float((tx - hx) * (-ux) + (tz - hz) * (-uz))  # 与“远离怪物方向”对齐
+                score = 1.2 * dist_after + 1.2 * away_align + (2.0 if cross_wall else 0.0)
+
+            score_list.append((score, dir_idx))
+
+        if not score_list:
+            return legal_action
+
+        score_list.sort(key=lambda x: x[0], reverse=True)
+        keep_dirs = set([d for _, d in score_list[:topk]])
+
+        new_flash = [0] * 8
+        for d in keep_dirs:
+            new_flash[d] = 1
+
+        if sum(new_flash) == 0:
+            new_flash = flash_base
+
+        for i in range(8):
+            legal_action[8 + i] = int(new_flash[i])
+
+        return legal_action
 
     def _compute_nearest_speed_buff_feature(self, organs, hero_pos, env_info):
         """Get nearest speed buff feature as [cd_norm, x_norm, z_norm, dist_norm]."""
@@ -2897,10 +3066,10 @@ class Preprocessor:
         # 更新全局地图，然后导出1x128x128特征。
         # 注意：地图记录每局开始即持续进行；仅模型输入在阈值步前做门控。
         new_explored_cells = self._update_explored_map(hero_pos, map_info)
-        global_map_feat = self._build_global_map_feature()
-        global_map_enabled = float(self.step_no >= int(getattr(Config, "GLOBAL_MAP_ENABLE_STEP", 400)))
-        if global_map_enabled < 0.5:
-            global_map_feat = np.zeros_like(global_map_feat, dtype=np.float32)
+        # global_map_feat = self._build_global_map_feature()
+        # global_map_enabled = float(self.step_no >= int(getattr(Config, "GLOBAL_MAP_ENABLE_STEP", 400)))
+        # if global_map_enabled < 0.5:
+        #     global_map_feat = np.zeros_like(global_map_feat, dtype=np.float32)
 
         # Legal action mask (16D) / 合法动作掩码
         legal_action = [1] * 16
@@ -2979,10 +3148,18 @@ class Preprocessor:
             # 保留全零掩码：环境会把它解释为不动，这里不做自动回填。
             pass
 
+        # 闪现mask重排：近怪时启用（平地=远离怪物；死角=怪物身后；两者都考虑穿墙）
+        legal_action = self._preprocess_flash_action_mask(
+            legal_action=legal_action,
+            monsters=frame_state.get("monsters", []),
+            hero_pos=hero_pos,
+            map_info=map_info,
+        )
+
         # Progress features (2D) / 进度特征
         #   [step_norm, global_map_enabled]
         step_norm = _norm(self.step_no, self.max_step)
-        progress_feat = np.array([step_norm, global_map_enabled], dtype=np.float32)
+        progress_feat = np.array([step_norm], dtype=np.float32)
 
         # Concatenate features / 拼接特征
         feature = np.concatenate(
@@ -3003,7 +3180,6 @@ class Preprocessor:
                 speed_buff_slots[0],
                 speed_buff_slots[1],
                 local_map_feat,
-                global_map_feat,
                 progress_feat,
             ]
         )
