@@ -13,7 +13,7 @@ map = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 # Whether to randomly select maps. true = randomly pick one from configured maps per episode, false = used sequentially.
 # 是否随机抽取地图。布尔值。true表示每局从配置的地图中随机抽取一张，false表示按顺序抽取地图训练。
-map_random = true
+map_random = false
 
 # Evaluation interval: every N training episodes, run 1 evaluation episode / 评估间隔：每N局训练后运行1局评估
 eval_interval = 10

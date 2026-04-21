@@ -122,15 +122,27 @@ class EpisodeRunner:
             "idle_wander_penalty": 0.0,
             "dead_end_penalty": 0.0,
         }
+        # 开图率相关：使用“最后一步值”而不是累加
+        self.explore_rate = 0.0
+        self.explored_cell_count = 0.0
+
         self.treasure_circle_enter_total = 0.0
         self.treasure_circle_hit_total = 0.0
         self.treasure_circle_hit_rate = 0.0
+
 
     def _update_reward_accumulators(self, reward_info):
         if reward_info:
             for key in self.reward_components:
                 if key in reward_info:
                     self.reward_components[key] += reward_info[key]
+
+            # 开图率相关：逐步覆盖为最新值
+            if "explore_rate" in reward_info:
+                self.explore_rate = float(reward_info["explore_rate"])
+            if "explored_cell_count" in reward_info:
+                self.explored_cell_count = float(reward_info["explored_cell_count"])
+
             if "treasure_circle_enter_total" in reward_info:
                 self.treasure_circle_enter_total = float(reward_info["treasure_circle_enter_total"])
             if "treasure_circle_hit_total" in reward_info:
@@ -138,8 +150,14 @@ class EpisodeRunner:
             if "treasure_circle_hit_rate" in reward_info:
                 self.treasure_circle_hit_rate = float(reward_info["treasure_circle_hit_rate"])
 
+
     def _get_reward_monitor_data(self):
         data = {k: round(v, 4) for k, v in self.reward_components.items()}
+
+        # 新增开图率监控
+        data["explore_rate"] = round(self.explore_rate, 6)
+        data["explored_cell_count"] = round(self.explored_cell_count, 2)
+
         data["treasure_circle_enter_total"] = round(self.treasure_circle_enter_total, 4)
         data["treasure_circle_hit_total"] = round(self.treasure_circle_hit_total, 4)
         data["treasure_circle_hit_rate"] = round(self.treasure_circle_hit_rate, 4)

@@ -68,6 +68,7 @@ def build_monitor():
         ("死角死路惩罚", "dead_end_penalty"),
         ("无移动次数", "no_movement_case"),
         ("MoveMask一致率", "move_mask_consistency_rate"),
+        ("开图率", "explore_rate"),
     ]
     for panel_name, metric_name in reward_panels:
         monitor.add_panel(name=panel_name, name_en=metric_name, type="line")

@@ -2838,6 +2838,8 @@ class Preprocessor:
             "idle_streak_steps": float(self.idle_streak_steps),
             "wander_streak_steps": float(self.wander_streak_steps),
             "total_reward": total_reward,
+            "explored_cell_count": float(len(self.observed_cells)),
+            "explore_rate": float(len(self.observed_cells)) / 16384.0,
         }
 
         # 更新已探索格子计数
