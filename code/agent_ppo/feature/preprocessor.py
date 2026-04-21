@@ -191,8 +191,10 @@ class Preprocessor:
             "speed_buff_approach_reward": {"enable": True, "coef": 0.05},
             "monster_dist_shaping": {"enable": True, "coef": 0.12},
             "wall_collision_penalty": {"enable": False, "coef": -0.05},
+            "danger_penalty": {"enable": False, "coef": -0.06, "power": 2.0},
             "exploration_reward": {"enable": True, "coef_per_cell": 0.0005},
-            "idle_wander_penalty": {"enable": True, "coef": -0.02},
+            "idle_wander_penalty": {"enable": False, "idle_coef": -0.01, "wander_coef": -0.02, "idle_growth": 0.02, "wander_growth": 0.02},
+            "dead_end_penalty": {"enable": False, "coef": -0.05},
         }
 
     def _deep_update(self, base: Dict[str, Any], updates: Dict[str, Any]) -> None:
@@ -276,12 +278,15 @@ class Preprocessor:
         # 按阶段训练时：阶段表 AND enable
         stage = self.get_curriculum_stage()
         stage_reward_map = {
-            1: {"survive_reward", "monster_dist_shaping"},
+            1: {"survive_reward", "monster_dist_shaping", "danger_penalty", "wall_collision_penalty", "dead_end_penalty"},
             2: {
                 "survive_reward",
                 "monster_dist_shaping",
                 "exploration_reward",
                 "idle_wander_penalty",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "dead_end_penalty",
             },
             3: {
                 "survive_reward",
@@ -292,6 +297,9 @@ class Preprocessor:
                 "speed_buff_reward",
                 "treasure_approach_reward",
                 "speed_buff_approach_reward",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "dead_end_penalty",
             },
             4: {
                 "survive_reward",
@@ -302,6 +310,9 @@ class Preprocessor:
                 "speed_buff_reward",
                 "treasure_approach_reward",
                 "speed_buff_approach_reward",
+                "danger_penalty",
+                "wall_collision_penalty",
+                "dead_end_penalty",
             },
         }
         return name in stage_reward_map.get(stage, stage_reward_map[1])
@@ -331,6 +342,14 @@ class Preprocessor:
 
         self.prev_treasure_count = 0
         self.prev_has_speed_buff = False
+
+        # State for idle/wander penalty tracking
+        self._idle_steps: int = 0
+        self._wander_points: deque = deque(maxlen=int(self._global_cfg("trajectory_window", 20)))
+
+        # State for dead-end penalty tracking
+        self._in_dead_end: bool = False
+        self._dead_end_anchor: Optional[Tuple[int, int]] = None
 
         self.step_count = 0
         self.last_reward_info: Dict[str, float] = {}
@@ -2189,12 +2208,14 @@ class Preprocessor:
             "treasure_approach_reward": 0.0,
             "speed_buff_approach_reward": 0.0,
             "monster_dist_shaping": 0.0,
+            "danger_penalty": 0.0,
             "wall_collision_penalty": 0.0,
             "is_illegal_action": 0.0,
             "is_blocked_after_legal": 0.0,
             "is_wall_collision": 0.0,
             "exploration_reward": 0.0,
             "idle_wander_penalty": 0.0,
+            "dead_end_penalty": 0.0,
         }
 
         # 1) 生存奖励
@@ -2292,6 +2313,18 @@ class Preprocessor:
                     "reward=", coef * delta,
                 )
 
+        # 4b) 危险惩罚：最近怪物距离过近时按幂函数惩罚
+        if self._is_stage_enabled("danger_penalty") and cur_monster_dist is not None:
+            danger_thr = float(self._global_cfg("danger_threshold", 0.15)) * MAP_SIZE
+            if self.step_count >= 300:
+                danger_thr = float(self._global_cfg("late_danger_threshold", 0.25)) * MAP_SIZE
+            d_coef = float(self._cfg("danger_penalty", "coef", -0.06))
+            d_power = float(self._cfg("danger_penalty", "power", 2.0))
+            d = float(cur_monster_dist)
+            if d < danger_thr:
+                x = float(np.clip((danger_thr - d) / max(danger_thr, 1e-6), 0.0, 1.0))
+                reward_terms["danger_penalty"] = float(d_coef * (x ** d_power))
+
         # 5) 撞墙 / 无效移动惩罚
         if last_action is not None and 0 <= int(last_action) < 8:
             prev_mask_val = None
@@ -2377,13 +2410,64 @@ class Preprocessor:
             )
 
         # 7) 原地不动 / 小范围徘徊惩罚
-        if self._is_stage_enabled("idle_wander_penalty") and self.prev_hero_pos is not None:
+        if self._is_stage_enabled("idle_wander_penalty"):
+            cur_x, cur_z = int(hero_pos["x"]), int(hero_pos["z"])
+            self._wander_points.append((cur_x, cur_z))
+
+            idle_coef = float(self._cfg("idle_wander_penalty", "idle_coef", -0.01))
+            idle_growth = float(self._cfg("idle_wander_penalty", "idle_growth", 0.02))
             if (
-                int(hero_pos["x"]) == int(self.prev_hero_pos["x"])
-                and int(hero_pos["z"]) == int(self.prev_hero_pos["z"])
+                self.prev_hero_pos is not None
+                and cur_x == int(self.prev_hero_pos["x"])
+                and cur_z == int(self.prev_hero_pos["z"])
             ):
-                reward_terms["idle_wander_penalty"] = float(
-                    self._cfg("idle_wander_penalty", "coef", -0.02)
+                self._idle_steps += 1
+                reward_terms["idle_wander_penalty"] += float(
+                    idle_coef * (1.0 + idle_growth * self._idle_steps)
+                )
+            else:
+                self._idle_steps = 0
+
+            wander_coef = float(self._cfg("idle_wander_penalty", "wander_coef", -0.02))
+            wander_growth = float(self._cfg("idle_wander_penalty", "wander_growth", 0.02))
+            wander_min_pts = int(self._global_cfg("wander_min_points", 8))
+            wander_radius_thr = float(self._global_cfg("wander_radius_threshold", 2.5))
+            if len(self._wander_points) >= wander_min_pts and self._idle_steps == 0:
+                sum_x = sum_z = 0
+                for px, pz in self._wander_points:
+                    sum_x += px
+                    sum_z += pz
+                n = len(self._wander_points)
+                cx = sum_x / n
+                cz = sum_z / n
+                wander_radius_thr_sq = wander_radius_thr ** 2
+                max_r_sq = max(
+                    (px - cx) ** 2 + (pz - cz) ** 2
+                    for px, pz in self._wander_points
+                )
+                if max_r_sq < wander_radius_thr_sq:
+                    reward_terms["idle_wander_penalty"] += float(
+                        wander_coef * (1.0 + wander_growth * n)
+                    )
+
+        # 8) 死角惩罚：agent 停留在局部死角时持续惩罚，离开后重置
+        if self._is_stage_enabled("dead_end_penalty") and map_info is not None:
+            cur_x, cur_z = int(hero_pos["x"]), int(hero_pos["z"])
+            map_arr = np.array(map_info, dtype=np.int32)
+            in_dead_end_now = self._is_local_dead_end(map_arr)
+            if in_dead_end_now:
+                self._in_dead_end = True
+                self._dead_end_anchor = (cur_x, cur_z)
+            elif self._in_dead_end and self._dead_end_anchor is not None:
+                reset_dist = float(self._global_cfg("dead_end_reset_distance", 8.0))
+                ax, az = self._dead_end_anchor
+                dist = float(((cur_x - ax) ** 2 + (cur_z - az) ** 2) ** 0.5)
+                if dist >= reset_dist:
+                    self._in_dead_end = False
+                    self._dead_end_anchor = None
+            if self._in_dead_end:
+                reward_terms["dead_end_penalty"] = float(
+                    self._cfg("dead_end_penalty", "coef", -0.05)
                 )
 
         self.prev_hero_pos = {"x": int(hero_pos["x"]), "z": int(hero_pos["z"])}

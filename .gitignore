@@ -2,3 +2,6 @@
 
 dev/log/
 *.log
+__pycache__/
+*.pyc
+*.pyo
