@@ -59,13 +59,13 @@ base = 0.02
 shaping_coef = 0.1
 
 [reward.danger_penalty]
-enable = false
-coef = -0.1
+enable = true
+coef = -0.06
 power = 2.0
 
 [reward.wall_collision_penalty]
-enable = false
-coef = -0.1
+enable = true
+coef = -0.03
 
 [reward.flash_fail_penalty]
 enable = false
@@ -112,15 +112,15 @@ enable = false
 coef = 0.05
 
 [reward.idle_wander_penalty]
-enable = false
-idle_coef = -0.03
-wander_coef = -0.05
+enable = true
+idle_coef = -0.01
+wander_coef = -0.02
 idle_growth = 0.02
 wander_growth = 0.02
 
 [reward.dead_end_penalty]
-enable = false
-coef = -0.1
+enable = true
+coef = -0.05
 
 # =========================
 # Stage-specific reward overrides
