@@ -20,6 +20,7 @@ PPO algorithm implementation for Gorge Chase PPO.
 import os
 import time
 
+import numpy as np
 import torch
 from agent_ppo.conf.conf import Config
 
@@ -47,6 +48,9 @@ class Algorithm:
 
         训练入口：对一批 SampleData 执行 PPO 更新。
         """
+        self._refresh_targets_with_current_critic(list_sample_data)
+        list_sample_data = self._priority_resample_batch(list_sample_data)
+
         obs = torch.stack([f.obs for f in list_sample_data]).to(self.device)
         legal_action = torch.stack([f.legal_action for f in list_sample_data]).to(self.device)
         act = torch.stack([f.act for f in list_sample_data]).to(self.device).view(-1, 1)
@@ -78,6 +82,11 @@ class Algorithm:
         self.optimizer.step()
         self.train_step += 1
 
+        adv_raw = advantage.view(-1)
+        adv_mean = float(adv_raw.mean().item())
+        adv_std = float(adv_raw.std(unbiased=False).item())
+        adv_abs_mean = float(torch.abs(adv_raw).mean().item())
+
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
             results = {
@@ -90,6 +99,9 @@ class Algorithm:
                 "clip_rate": round(info_list[5].item(), 6),
                 "clip_abs_overflow": round(info_list[6].item(), 6),
                 "reward": round(reward.mean().item(), 4),
+                "adv": round(adv_abs_mean, 6),
+                "adv_mean": round(adv_mean, 6),
+                "adv_std": round(adv_std, 6),
             }
             self.logger.info(
                 f"[train] total_loss:{results['total_loss']} "
@@ -99,11 +111,117 @@ class Algorithm:
                 f"explained_variance:{results['explained_variance']} "
                 f"clip_count:{results['clip_count']} "
                 f"clip_rate:{results['clip_rate']} "
-                f"clip_abs_overflow:{results['clip_abs_overflow']}"
+                f"clip_abs_overflow:{results['clip_abs_overflow']} "
+                f"adv:{results['adv']} "
+                f"adv_mean:{results['adv_mean']} "
+                f"adv_std:{results['adv_std']}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
             self.last_report_monitor_time = now
+
+    def _refresh_targets_with_current_critic(self, list_sample_data):
+        """Refresh reward_sum/advantage with current critic to reduce stale targets.
+
+        使用当前 Critic 基于 (obs, next_obs, reward, done) 重新计算目标，
+        避免长期复用旧 value 估计带来的 target 过时问题。
+        """
+        if not list_sample_data:
+            return
+
+        def _column_tensor(values):
+            t = torch.stack(values).to(self.device)
+            return t.reshape(len(values), -1)[:, :1]
+
+        obs = torch.stack([f.obs for f in list_sample_data]).to(self.device)
+        obs = obs.reshape(len(list_sample_data), -1)
+
+        next_obs_items = []
+        for sample in list_sample_data:
+            cur_obs = sample.obs
+            candidate_next_obs = getattr(sample, "next_obs", None)
+            if candidate_next_obs is None:
+                next_obs_items.append(cur_obs)
+                continue
+
+            cur_obs_numel = int(torch.as_tensor(cur_obs).numel())
+            next_obs_numel = int(torch.as_tensor(candidate_next_obs).numel())
+            if next_obs_numel != cur_obs_numel:
+                next_obs_items.append(cur_obs)
+            else:
+                next_obs_items.append(candidate_next_obs)
+
+        next_obs = torch.stack(next_obs_items).to(self.device)
+        next_obs = next_obs.reshape(len(list_sample_data), -1)
+
+        reward = _column_tensor([f.reward for f in list_sample_data])
+        done = _column_tensor([f.done for f in list_sample_data])
+
+        self.model.set_eval_mode()
+        with torch.no_grad():
+            _, value_current = self.model(obs)
+            _, next_value_current = self.model(next_obs)
+
+        value_current = value_current.reshape(len(list_sample_data), -1)[:, :1]
+        next_value_current = next_value_current.reshape(len(list_sample_data), -1)[:, :1]
+
+        not_done = 1.0 - done
+        # Transition-level replay does not guarantee full trajectory order;
+        # use one-step bootstrap targets with current critic values.
+        delta = reward + Config.GAMMA * not_done * next_value_current - value_current
+        advantage = delta
+        reward_sum = advantage + value_current
+
+        advantage_cpu = advantage.detach().cpu()
+        reward_sum_cpu = reward_sum.detach().cpu()
+        for i, sample in enumerate(list_sample_data):
+            sample.advantage = advantage_cpu[i].reshape(-1)[:1]
+            sample.reward_sum = reward_sum_cpu[i].reshape(-1)[:1]
+
+    def _priority_resample_batch(self, list_sample_data):
+        """Resample a batch according to reward_sum + advantage priority.
+
+        高优先级样本允许重复，低优先级样本允许丢弃，然后重排到固定 batch size。
+        """
+        if not bool(getattr(Config, "PRIORITY_REPLAY_ENABLE", True)):
+            return list_sample_data
+
+        batch_size = len(list_sample_data)
+        if batch_size <= 1:
+            return list_sample_data
+
+        priorities = []
+        for sample in list_sample_data:
+            reward_sum = float(np.asarray(sample.reward_sum, dtype=np.float32).reshape(-1)[0])
+            advantage = float(np.asarray(sample.advantage, dtype=np.float32).reshape(-1)[0])
+            priority = reward_sum + advantage
+            if not np.isfinite(priority):
+                priority = 0.0
+            priorities.append(priority)
+
+        priority_arr = np.asarray(priorities, dtype=np.float64)
+        priority_mean = float(np.mean(priority_arr))
+        priority_std = float(np.std(priority_arr))
+        normalized = (priority_arr - priority_mean) / max(priority_std, 1e-6)
+
+        temperature = max(float(getattr(Config, "PRIORITY_REPLAY_TEMPERATURE", 1.0)), 1e-6)
+        logits = normalized / temperature
+        logits = logits - float(np.max(logits))
+        weights = np.exp(logits)
+        weight_sum = float(np.sum(weights))
+        if not np.isfinite(weight_sum) or weight_sum <= 1e-12:
+            probs = np.ones(batch_size, dtype=np.float64) / float(batch_size)
+        else:
+            probs = weights / weight_sum
+
+        uniform_ratio = float(getattr(Config, "PRIORITY_REPLAY_UNIFORM_RATIO", 0.1))
+        uniform_ratio = min(max(uniform_ratio, 0.0), 1.0)
+        probs = (1.0 - uniform_ratio) * probs + uniform_ratio * (np.ones(batch_size, dtype=np.float64) / float(batch_size))
+        probs = probs / float(np.sum(probs))
+
+        sample_indices = np.random.choice(batch_size, size=batch_size, replace=True, p=probs)
+        np.random.shuffle(sample_indices)
+        return [list_sample_data[int(idx)] for idx in sample_indices]
 
     def _compute_loss(
         self,
@@ -132,6 +250,7 @@ class Algorithm:
         clip_low = 1.0 - self.clip_param
         clip_high = 1.0 + self.clip_param
         adv = advantage.view(-1, 1)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         policy_loss1 = -ratio * adv
         clipped_ratio = ratio.clamp(clip_low, clip_high)
         policy_loss2 = -clipped_ratio * adv

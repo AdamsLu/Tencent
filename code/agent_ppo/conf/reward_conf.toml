@@ -22,9 +22,9 @@ flash_fail_ratio = 0.3
 flash_expected_dist_orthogonal = 10.0
 flash_expected_dist_diagonal = 8.0
 centroid_norm_max = 64.0
-
-[reward.training]
-use_curriculum = true
+visit_cell_size = 3
+monster_speedup_detect_eps = 0.5
+treasure_detect_radius = 4.0
 
 [reward.survive_reward]
 enable = true
@@ -32,57 +32,76 @@ coef = 1
 
 [reward.treasure_reward]
 enable = true
-coef = 1
+coef = 60
+second_monster_spawn_mult = 0.5
+first_monster_speedup_mult = 0.3
+second_monster_speedup_mult = 0.2
 
 [reward.speed_buff_reward]
 enable = true
-coef = 1
+coef = 80.0
+second_monster_spawn_mult = 1.2
+first_monster_speedup_mult = 1.5
+second_monster_speedup_mult = 2
 
 [reward.speed_buff_approach_reward]
 enable = true
 coef = 1
+gravity_coef = 5
+power = 0.60206
+min_reward = 0.001
+max_reward = 16.0
+min_dist_norm = 0.00554
+second_monster_spawn_gravity_mult = 1.20
+first_monster_speedup_gravity_mult = 1.35
+second_monster_speedup_gravity_mult = 1.50
 
 [reward.treasure_approach_reward]
 enable = true
-gravity_coef = 0.00005
-min_reward = 0.0001
-max_reward = 0.05
-min_dist_norm = 0.005
+gravity_coef = 5
+power = 0.60206
+min_reward = 0.001
+max_reward = 16.0
+min_dist_norm = 0.00554
+second_monster_spawn_gravity_mult = 0.80
+first_monster_speedup_gravity_mult = 0.65
+second_monster_speedup_gravity_mult = 0.50
 
 [reward.monster_dist_shaping]
 enable = true
-coef = 1
+coef = 0.0
 
 [reward.late_survive_reward]
-enable = false
-base = 0.02
-shaping_coef = 0.1
+enable = true
+base = 0.5
+shaping_coef = 0.0
 
 [reward.danger_penalty]
-enable = false
-coef = -0.1
+enable = true
+coef = -1.5
 power = 2.0
 
 [reward.wall_collision_penalty]
-enable = false
+enable = true
 coef = -0.1
 
 [reward.flash_fail_penalty]
-enable = false
+enable = true
 coef = -0.15
 
 [reward.flash_escape_reward]
-enable = false
+enable = true
 base = 1.0
-dist_gain_coef = 1.0
+dist_gain_coef = 0.0
+trigger_threshold = 0.10
 
 [reward.flash_survival_reward]
-enable = false
-init = 0.5
+enable = true
+init = 0.3
 decay = 0.90
 
 [reward.flash_abuse_penalty]
-enable = false
+enable = true
 caught_within_steps = 15
 caught_coef = -1.0
 safe_zone_no_treasure_coef = -1.0
@@ -93,216 +112,42 @@ caught_coef_start = -10.0
 caught_coef_end = -1.0
 
 [reward.speed_buff_escape_reward]
-enable = false
+enable = true
 init = 0.05
 decay = 0.97
 base = 1.0
 dist_delta_coef = 0.1
 
 [reward.safe_zone_reward]
-enable = false
-coef = 0.01
+enable = true
+coef = 0.5
+second_monster_spawn_mult = 1.0
+first_monster_speedup_mult = 1.2
+second_monster_speedup_mult = 1.5
 
 [reward.exploration_reward]
-enable = false
-coef_per_cell = 0.0002
+enable = true
+coef_per_cell = 0.02
 
 [reward.centroid_away_reward]
-enable = false
+enable = true
 coef = 0.05
 
 [reward.idle_wander_penalty]
-enable = false
-idle_coef = -0.03
-wander_coef = -0.05
-idle_growth = 0.02
-wander_growth = 0.02
+enable = true
+idle_coef = -1
+wander_coef = -0.5
+idle_growth = 0.5
+wander_growth = 0.5
 
 [reward.dead_end_penalty]
 enable = false
-coef = -0.1
+coef = -1.0
+second_monster_spawn_mult = 1.0
+first_monster_speedup_mult = 2
+second_monster_speedup_mult = 3
 
-# =========================
-# Stage-specific reward overrides
-# 说明：
-# 1. 这里写的是“按阶段覆盖”的参数，优先级高于上面的全局基础值
-# 2. 只覆盖你想改的项；未写出的参数仍沿用全局基础值
-# =========================
-
-# -------------------------
-# Stage 1: survival_base
-# -------------------------
-[reward.stage_overrides.stage1.survive_reward]
-coef = 0.50
-
-[reward.stage_overrides.stage1.monster_dist_shaping]
-coef = 20.0
-
-[reward.stage_overrides.stage1.danger_penalty]
-coef = -0.10
-power = 2.0
-
-[reward.stage_overrides.stage1.wall_collision_penalty]
-coef = -0.10
-
-# -------------------------
-# Stage 2: explore_and_stabilize
-# -------------------------
-[reward.stage_overrides.stage2.survive_reward]
-coef = 0.50
-
-[reward.stage_overrides.stage2.monster_dist_shaping]
-coef = 18.0
-
-[reward.stage_overrides.stage2.danger_penalty]
-coef = -0.10
-power = 2.0
-
-[reward.stage_overrides.stage2.wall_collision_penalty]
-coef = -0.10
-
-[reward.stage_overrides.stage2.exploration_reward]
-coef_per_cell = 0.00025
-
-[reward.stage_overrides.stage2.centroid_away_reward]
-coef = 0.06
-
-[reward.stage_overrides.stage2.idle_wander_penalty]
-idle_coef = -0.035
-wander_coef = -0.055
-idle_growth = 0.022
-wander_growth = 0.022
-
-[reward.stage_overrides.stage2.safe_zone_reward]
-coef = 0.008
-
-# -------------------------
-# Stage 3: safe_resource_acquisition
-# 核心思路：降低“纯保守/纯探索”比重，抬高资源导向
-# -------------------------
-[reward.stage_overrides.stage3.survive_reward]
-coef = 0.40
-
-[reward.stage_overrides.stage3.monster_dist_shaping]
-coef = 12.0
-
-[reward.stage_overrides.stage3.danger_penalty]
-coef = -0.12
-power = 2.0
-
-[reward.stage_overrides.stage3.wall_collision_penalty]
-coef = -0.10
-
-[reward.stage_overrides.stage3.exploration_reward]
-coef_per_cell = 0.00012
-
-[reward.stage_overrides.stage3.centroid_away_reward]
-coef = 0.03
-
-[reward.stage_overrides.stage3.idle_wander_penalty]
-idle_coef = -0.035
-wander_coef = -0.060
-idle_growth = 0.020
-wander_growth = 0.025
-
-[reward.stage_overrides.stage3.safe_zone_reward]
-coef = 0.004
-
-[reward.stage_overrides.stage3.treasure_reward]
-coef = 3.0
-
-[reward.stage_overrides.stage3.treasure_approach_reward]
-gravity_coef = 0.00008
-min_reward = 0.0002
-max_reward = 0.08
-min_dist_norm = 0.005
-
-[reward.stage_overrides.stage3.speed_buff_reward]
-coef = 1.5
-
-[reward.stage_overrides.stage3.speed_buff_approach_reward]
-coef = 0.12
-
-[reward.stage_overrides.stage3.speed_buff_escape_reward]
-init = 0.05
-decay = 0.97
-base = 1.2
-dist_delta_coef = 0.12
-
-# -------------------------
-# Stage 4: full_game_and_skill_refine
-# 核心思路：继续资源导向，同时放开技能学习
-# -------------------------
-[reward.stage_overrides.stage4.survive_reward]
-coef = 0.35
-
-[reward.stage_overrides.stage4.monster_dist_shaping]
-coef = 10.0
-
-[reward.stage_overrides.stage4.danger_penalty]
-coef = -0.12
-power = 2.0
-
-[reward.stage_overrides.stage4.wall_collision_penalty]
-coef = -0.10
-
-[reward.stage_overrides.stage4.exploration_reward]
-coef_per_cell = 0.00008
-
-[reward.stage_overrides.stage4.centroid_away_reward]
-coef = 0.02
-
-[reward.stage_overrides.stage4.idle_wander_penalty]
-idle_coef = -0.030
-wander_coef = -0.050
-idle_growth = 0.018
-wander_growth = 0.020
-
-[reward.stage_overrides.stage4.safe_zone_reward]
-coef = 0.002
-
-[reward.stage_overrides.stage4.treasure_reward]
-coef = 3.5
-
-[reward.stage_overrides.stage4.treasure_approach_reward]
-gravity_coef = 0.00010
-min_reward = 0.0002
-max_reward = 0.10
-min_dist_norm = 0.005
-
-[reward.stage_overrides.stage4.speed_buff_reward]
-coef = 1.2
-
-[reward.stage_overrides.stage4.speed_buff_approach_reward]
-coef = 0.08
-
-[reward.stage_overrides.stage4.speed_buff_escape_reward]
-init = 0.04
-decay = 0.97
-base = 1.2
-dist_delta_coef = 0.12
-
-[reward.stage_overrides.stage4.late_survive_reward]
-base = 0.03
-shaping_coef = 0.12
-
-[reward.stage_overrides.stage4.flash_fail_penalty]
-coef = -0.15
-
-[reward.stage_overrides.stage4.flash_escape_reward]
-base = 1.5
-dist_gain_coef = 1.2
-
-[reward.stage_overrides.stage4.flash_survival_reward]
-init = 0.7
-decay = 0.92
-
-[reward.stage_overrides.stage4.flash_abuse_penalty]
-caught_within_steps = 15
-caught_coef = -1.0
-safe_zone_no_treasure_coef = -0.8
-caught_decay_enable = true
-caught_decay_min_step = 1
-caught_decay_max_step = 15
-caught_coef_start = -6.0
-caught_coef_end = -1.0
+[reward.visit_tracking_reward]
+enable = true
+first_visit = 0.3
+second_visit = 0.1

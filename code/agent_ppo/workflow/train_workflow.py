@@ -24,13 +24,23 @@ import time
 import random
 
 import numpy as np
+from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import SampleData, sample_process
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
-from collections import deque
+
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
+    if not envs:
+        if logger is not None:
+            logger.error("workflow received empty envs, skip current run")
+        return
+    if not agents:
+        if logger is not None:
+            logger.error("workflow received empty agents, skip current run")
+        return
+
     last_save_model_time = time.time()
     env = envs[0]
     agent = agents[0]
@@ -82,23 +92,8 @@ class EpisodeRunner:
         self.eval_maps = usr_conf.get("env_conf", {}).get("eval_maps", [8, 9, 10])
         self.eval_interval = usr_conf.get("env_conf", {}).get("eval_interval", 10)
         self.map_random = usr_conf.get("env_conf", {}).get("map_random", True)
-        self.max_step = int(usr_conf.get("env_conf", {}).get("max_step", 1000))
 
-        # ================= curriculum config =================
-        self.curriculum_cfg = usr_conf.get("curriculum", {})
-        self.curriculum_stage = int(self.curriculum_cfg.get("initial_stage", 1))
-        self.curriculum_stage = max(1, min(4, self.curriculum_stage))
-
-        self.curriculum_window_size = int(self.curriculum_cfg.get("metric_window_size", 30))
-        self.curriculum_min_train_episodes = int(
-            self.curriculum_cfg.get("min_train_episodes_per_stage", 30)
-        )
-
-        self.stage_metric_window = deque(maxlen=self.curriculum_window_size)
-        self.stage_train_episode_cnt = 0
-        self.stage_transition_cnt = 0
         self._reset_reward_accumulators()
-        self.last_eval_trigger_train_episode = -1
 
     def _reset_reward_accumulators(self):
         self.reward_components = {
@@ -111,9 +106,6 @@ class EpisodeRunner:
             "late_survive_reward": 0.0,
             "danger_penalty": 0.0,
             "wall_collision_penalty": 0.0,
-            "is_illegal_action": 0.0,
-            "is_blocked_after_legal": 0.0,
-            "is_wall_collision": 0.0,
             "flash_fail_penalty": 0.0,
             "flash_escape_reward": 0.0,
             "flash_survival_reward": 0.0,
@@ -121,306 +113,120 @@ class EpisodeRunner:
             "safe_zone_reward": 0.0,
             "flash_abuse_penalty": 0.0,
             "flash_abuse_penalty_caught": 0.0,
+            "no_movement_case": 0.0,
+            "move_mask_consistency_hit": 0.0,
+            "move_mask_consistency_total": 0.0,
             "exploration_reward": 0.0,
+            "visit_tracking_reward": 0.0,
             "centroid_away_reward": 0.0,
             "idle_wander_penalty": 0.0,
             "dead_end_penalty": 0.0,
         }
+        self.treasure_circle_enter_total = 0.0
+        self.treasure_circle_hit_total = 0.0
+        self.treasure_circle_hit_rate = 0.0
 
     def _update_reward_accumulators(self, reward_info):
         if reward_info:
             for key in self.reward_components:
                 if key in reward_info:
                     self.reward_components[key] += reward_info[key]
+            if "treasure_circle_enter_total" in reward_info:
+                self.treasure_circle_enter_total = float(reward_info["treasure_circle_enter_total"])
+            if "treasure_circle_hit_total" in reward_info:
+                self.treasure_circle_hit_total = float(reward_info["treasure_circle_hit_total"])
+            if "treasure_circle_hit_rate" in reward_info:
+                self.treasure_circle_hit_rate = float(reward_info["treasure_circle_hit_rate"])
 
     def _get_reward_monitor_data(self):
-        return {k: round(v, 4) for k, v in self.reward_components.items()}
-
-    def _get_curriculum_stage(self):
-        preprocessor = getattr(self.agent, "preprocessor", None)
-        if preprocessor is None:
-            return 1
-        return int(getattr(preprocessor, "curriculum_stage", 1))
-
-    def _get_curriculum_stage_name(self, stage=None):
-        if stage is None:
-            stage = self._get_curriculum_stage()
-        stage_name_map = {
-            1: "survival_base",
-            2: "explore_and_stabilize",
-            3: "safe_resource_acquisition",
-            4: "full_game_and_skill_refine",
-        }
-        return stage_name_map.get(int(stage), "unknown")
-
-    def _use_curriculum_training(self):
-        preprocessor = getattr(self.agent, "preprocessor", None)
-        if preprocessor is None:
-            return True
-        fn = getattr(preprocessor, "use_curriculum_training", None)
-        if callable(fn):
-            return bool(fn())
-        return True
-
-    def _apply_curriculum_stage_to_agent(self):
-        if hasattr(self.agent, "preprocessor") and self.agent.preprocessor is not None:
-            self.agent.preprocessor.set_curriculum_stage(self.curriculum_stage)
-
-    def _get_stage_name(self):
-        if hasattr(self.agent, "preprocessor") and self.agent.preprocessor is not None:
-            return self.agent.preprocessor.get_curriculum_stage_name()
-        stage_name_map = {
-            1: "survival_base",
-            2: "explore_and_stabilize",
-            3: "safe_resource_acquisition",
-            4: "full_game_and_skill_refine",
-        }
-        return stage_name_map.get(self.curriculum_stage, "unknown")
-
-    def _safe_div(self, num, den, default=0.0):
-        den = float(den)
-        if abs(den) <= 1e-8:
-            return float(default)
-        return float(num) / den
-
-    def _estimate_event_count(self, reward_value, reward_name, default_coef=1.0):
-        coef = default_coef
-        if hasattr(self.agent, "preprocessor") and self.agent.preprocessor is not None:
-            coef = abs(self.agent.preprocessor.get_reward_term_coef(reward_name, "coef", default_coef))
-        coef = float(abs(coef))
-        if coef <= 1e-8:
-            return 0.0
-        return abs(float(reward_value)) / coef
-
-    def _build_episode_metrics(self, step, sim_score):
-        rc = self.reward_components
-
-        survival_rate = self._safe_div(step, self.max_step, 0.0)
-
-        illegal_action_rate = self._safe_div(
-            rc.get("is_illegal_action", 0.0),
-            step,
-            0.0,
-        )
-
-        blocked_after_legal_rate = self._safe_div(
-            rc.get("is_blocked_after_legal", 0.0),
-            step,
-            0.0,
-        )
-
-        wall_collision_rate = illegal_action_rate + blocked_after_legal_rate
-
-        danger_penalty_per_step = self._safe_div(
-            abs(rc.get("danger_penalty", 0.0)),
-            step,
-            0.0,
-        )
-
-        idle_penalty_per_step = self._safe_div(
-            abs(rc.get("idle_wander_penalty", 0.0)),
-            step,
-            0.0,
-        )
-
-        dead_end_penalty_per_step = self._safe_div(
-            abs(rc.get("dead_end_penalty", 0.0)),
-            step,
-            0.0,
-        )
-
-        exploration_score = float(
-            rc.get("exploration_reward", 0.0) + rc.get("centroid_away_reward", 0.0)
-        )
-
-        treasure_count = self._estimate_event_count(
-            rc.get("treasure_reward", 0.0), "treasure_reward", 1.0
-        )
-
-        buff_count = self._estimate_event_count(
-            rc.get("speed_buff_reward", 0.0), "speed_buff_reward", 1.0
-        )
-
-        treasure_approach_reward = float(rc.get("treasure_approach_reward", 0.0))
-
-        return {
-            "survival_rate": float(survival_rate),
-            "wall_collision_rate": float(wall_collision_rate),
-            "illegal_action_rate": float(illegal_action_rate),
-            "blocked_after_legal_rate": float(blocked_after_legal_rate),
-            "danger_penalty_per_step": float(danger_penalty_per_step),
-            "idle_penalty_per_step": float(idle_penalty_per_step),
-            "dead_end_penalty_per_step": float(dead_end_penalty_per_step),
-            "exploration_score": float(exploration_score),
-            "treasure_count": float(treasure_count),
-            "buff_count": float(buff_count),
-            "treasure_approach_reward": float(treasure_approach_reward),
-            "sim_score": float(sim_score),
-        }
-
-    def _get_curriculum_progress_monitor_data(self):
-        """Always-on curriculum progress metrics."""
-        return {
-            "curriculum_stage": int(self.curriculum_stage),
-            "curriculum_stage_transition_cnt": int(self.stage_transition_cnt),
-            "stage_train_episode_cnt": int(self.stage_train_episode_cnt),
-            "curriculum_window_size": int(self.curriculum_window_size),
-            "curriculum_window_fill": int(len(self.stage_metric_window)),
-        }
-
-    def _get_curriculum_episode_monitor_data(self, episode_metrics):
-        """Train-only curriculum decision metrics."""
-        if episode_metrics is None:
-            return {}
-
-        data = {}
-        for k in [
-            "survival_rate",
-            "wall_collision_rate",
-            "illegal_action_rate",
-            "blocked_after_legal_rate",
-            "danger_penalty_per_step",
-            "idle_penalty_per_step",
-            "dead_end_penalty_per_step",
-            "exploration_score",
-            "treasure_count",
-            "buff_count",
-            "treasure_approach_reward",
-        ]:
-            data[k] = round(float(episode_metrics.get(k, 0.0)), 6)
+        data = {k: round(v, 4) for k, v in self.reward_components.items()}
+        data["treasure_circle_enter_total"] = round(self.treasure_circle_enter_total, 4)
+        data["treasure_circle_hit_total"] = round(self.treasure_circle_hit_total, 4)
+        data["treasure_circle_hit_rate"] = round(self.treasure_circle_hit_rate, 4)
         return data
-
-    def _mean_metric(self, name):
-        if not self.stage_metric_window:
-            return 0.0
-        return float(np.mean([m.get(name, 0.0) for m in self.stage_metric_window]))
-
-    def _check_stage_transition_ready(self):
-        if not self._use_curriculum_training():
-            return False, {}
-
-        if self.curriculum_stage >= 4:
-            return False, {}
-        if self.stage_train_episode_cnt < self.curriculum_min_train_episodes:
-            return False, {}
-        if len(self.stage_metric_window) < self.curriculum_window_size:
-            return False, {}
-
-        avg_metrics = {
-            "survival_rate": self._mean_metric("survival_rate"),
-            "wall_collision_rate": self._mean_metric("wall_collision_rate"),
-            "illegal_action_rate": self._mean_metric("illegal_action_rate"),
-            "blocked_after_legal_rate": self._mean_metric("blocked_after_legal_rate"),
-            "danger_penalty_per_step": self._mean_metric("danger_penalty_per_step"),
-            "idle_penalty_per_step": self._mean_metric("idle_penalty_per_step"),
-            "dead_end_penalty_per_step": self._mean_metric("dead_end_penalty_per_step"),
-            "exploration_score": self._mean_metric("exploration_score"),
-            "treasure_count": self._mean_metric("treasure_count"),
-            "buff_count": self._mean_metric("buff_count"),
-            "treasure_approach_reward": self._mean_metric("treasure_approach_reward"),
-            "sim_score": self._mean_metric("sim_score"),
-        }
-
-        if self.curriculum_stage == 1:
-            cond = (
-                avg_metrics["survival_rate"] >= float(
-                    self.curriculum_cfg.get("stage1_to_stage2", {}).get("avg_survival_rate", 0.35)
-                )
-                and avg_metrics["wall_collision_rate"] <= float(
-                    self.curriculum_cfg.get("stage1_to_stage2", {}).get("max_wall_collision_rate", 0.025)
-                )
-                and avg_metrics["danger_penalty_per_step"] <= float(
-                    self.curriculum_cfg.get("stage1_to_stage2", {}).get("max_danger_penalty_per_step", 0.015)
-                )
-            )
-            return cond, avg_metrics
-
-        if self.curriculum_stage == 2:
-            cond = (
-                avg_metrics["survival_rate"] >= float(
-                    self.curriculum_cfg.get("stage2_to_stage3", {}).get("avg_survival_rate", 0.55)
-                )
-                and avg_metrics["exploration_score"] >= float(
-                    self.curriculum_cfg.get("stage2_to_stage3", {}).get("min_exploration_score", 0.08)
-                )
-                and avg_metrics["idle_penalty_per_step"] <= float(
-                    self.curriculum_cfg.get("stage2_to_stage3", {}).get("max_idle_penalty_per_step", 0.010)
-                )
-                and avg_metrics["dead_end_penalty_per_step"] <= float(
-                    self.curriculum_cfg.get("stage2_to_stage3", {}).get("max_dead_end_penalty_per_step", 0.004)
-                )
-            )
-            return cond, avg_metrics
-
-        if self.curriculum_stage == 3:
-            cond = (
-                avg_metrics["survival_rate"] >= float(
-                    self.curriculum_cfg.get("stage3_to_stage4", {}).get("avg_survival_rate", 0.70)
-                )
-                and avg_metrics["treasure_count"] >= float(
-                    self.curriculum_cfg.get("stage3_to_stage4", {}).get("min_treasure_count", 0.80)
-                )
-                and avg_metrics["buff_count"] >= float(
-                    self.curriculum_cfg.get("stage3_to_stage4", {}).get("min_buff_count", 0.20)
-                )
-                and avg_metrics["treasure_approach_reward"] >= float(
-                    self.curriculum_cfg.get("stage3_to_stage4", {}).get("min_treasure_approach_reward", 0.03)
-                )
-            )
-            return cond, avg_metrics
-
-        return False, avg_metrics
-
-    def _maybe_advance_curriculum_stage(self):
-        ready, avg_metrics = self._check_stage_transition_ready()
-        if not ready:
-            return
-
-        old_stage = self.curriculum_stage
-        self.curriculum_stage = min(4, self.curriculum_stage + 1)
-        self.stage_transition_cnt += 1
-        self.stage_metric_window.clear()
-        self.stage_train_episode_cnt = 0
-        self._apply_curriculum_stage_to_agent()
-
-        self.logger.info(
-            "[curriculum] stage advance: %d -> %d (%s) | "
-            "survival_rate=%.4f wall_collision_rate=%.4f "
-            "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
-            "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
-            "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
-            % (
-                old_stage,
-                self.curriculum_stage,
-                self._get_stage_name(),
-                avg_metrics.get("survival_rate", 0.0),
-                avg_metrics.get("wall_collision_rate", 0.0),
-                avg_metrics.get("illegal_action_rate", 0.0),
-                avg_metrics.get("blocked_after_legal_rate", 0.0),
-                avg_metrics.get("danger_penalty_per_step", 0.0),
-                avg_metrics.get("exploration_score", 0.0),
-                avg_metrics.get("idle_penalty_per_step", 0.0),
-                avg_metrics.get("dead_end_penalty_per_step", 0.0),
-                avg_metrics.get("treasure_count", 0.0),
-                avg_metrics.get("buff_count", 0.0),
-                avg_metrics.get("treasure_approach_reward", 0.0),
-                avg_metrics.get("sim_score", 0.0),
-            )
-        )
 
     def _is_eval_episode(self):
         if self.eval_interval <= 0 or not self.eval_maps:
             return False
 
-        if (
-            self.train_episode_cnt > 0
-            and self.train_episode_cnt % self.eval_interval == 0
-            and self.train_episode_cnt != self.last_eval_trigger_train_episode
-        ):
-            self.last_eval_trigger_train_episode = self.train_episode_cnt
+        # 仅在“刚达到训练间隔”时置位一次，消费后立即清零，
+        # 避免达到阈值后连续多局都被判为eval。
+        if (not self.eval_pending
+                and self.train_episode_cnt > 0
+                and self.train_episode_cnt % self.eval_interval == 0):
+            self.eval_pending = True
+
+        if self.eval_pending:
+            self.eval_pending = False
             return True
 
         return False
+
+    def _is_monster_active(self, monster):
+        if not isinstance(monster, dict):
+            return False
+        pos = monster.get("pos", None)
+        if not isinstance(pos, dict):
+            return False
+        try:
+            mx = int(pos.get("x", 0))
+            mz = int(pos.get("z", 0))
+        except Exception:
+            return False
+        return not (mx == 0 and mz == 0)
+
+    def _resolve_approach_gravity_stage(self, env_obs):
+        """Resolve stage in workflow, keeping preprocessor reward logic lightweight."""
+        try:
+            observation = env_obs.get("observation", {}) if isinstance(env_obs, dict) else {}
+            frame_state = observation.get("frame_state", {}) if isinstance(observation, dict) else {}
+            env_info = observation.get("env_info", {}) if isinstance(observation, dict) else {}
+
+            monsters = frame_state.get("monsters", []) if isinstance(frame_state, dict) else []
+            m0 = monsters[0] if len(monsters) > 0 else None
+            m1 = monsters[1] if len(monsters) > 1 else None
+
+            m0_active = self._is_monster_active(m0)
+            m1_active = self._is_monster_active(m1)
+
+            base_speed = float(env_info.get("monster_speed", 1.0))
+            speed_eps = 0.5
+            try:
+                pre = getattr(self.agent, "preprocessor", None)
+                if pre is not None and hasattr(pre, "_global_cfg"):
+                    speed_eps = float(pre._global_cfg("monster_speedup_detect_eps", 0.5))
+            except Exception:
+                speed_eps = 0.5
+
+            def speedup(monster, active):
+                if (not active) or (not isinstance(monster, dict)):
+                    return False
+                cur_speed = float(monster.get("speed", base_speed))
+                return cur_speed >= (base_speed + speed_eps)
+
+            m0_speedup = speedup(m0, m0_active)
+            m1_speedup = speedup(m1, m1_active)
+
+            monster_interval = int(env_info.get("monster_interval", -1))
+            step_no = int(observation.get("step_no", env_info.get("step_no", 0)))
+            m1_should_spawn_by_step = (monster_interval > 0) and (step_no >= monster_interval)
+            second_monster_spawned = m1_active or m1_should_spawn_by_step
+
+            if m1_speedup:
+                return "second_monster_speedup"
+            if m0_speedup:
+                return "first_monster_speedup"
+            if second_monster_spawned:
+                return "second_monster_spawn"
+            return "base"
+        except Exception:
+            return "base"
+
+    def _apply_approach_gravity_stage(self, env_obs):
+        stage = self._resolve_approach_gravity_stage(env_obs)
+        if hasattr(self.agent, "set_approach_gravity_stage"):
+            self.agent.set_approach_gravity_stage(stage)
+        return stage
 
     def run_episodes(self):
         """Run episodes with train/eval alternation.
@@ -452,29 +258,25 @@ class EpisodeRunner:
                 continue
 
             self.agent.reset(env_obs)
-            self._apply_curriculum_stage_to_agent()
+            if hasattr(self.agent, "set_episode_mode"):
+                self.agent.set_episode_mode(mode)
+            self._apply_approach_gravity_stage(env_obs)
             self.agent.load_model(id="latest")
 
             obs_data, remain_info = self.agent.observation_process(env_obs)
-            collector = []
 
+            collector = []
             self.episode_cnt += 1
             done = False
             step = 0
             total_reward = 0.0
-
             # 记录最近一次闪现动作所在的样本帧索引，用于延迟奖励/惩罚离线回填
             last_flash_frame_idx = None
 
             self._reset_reward_accumulators()
 
-            curr_stage = self._get_curriculum_stage()
-            curr_stage_name = self._get_curriculum_stage_name(curr_stage)
-
             self.logger.info(
-                f"Episode {self.episode_cnt} start | "
-                f"Mode: {mode} | Map: {selected_map} | "
-                f"Stage: {curr_stage} ({curr_stage_name})"
+                f"Episode {self.episode_cnt} start | Mode: {mode} | Map: {selected_map}"
             )
 
             while not done:
@@ -491,6 +293,7 @@ class EpisodeRunner:
                 step += 1
                 done = terminated or truncated
 
+                self._apply_approach_gravity_stage(env_obs)
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
@@ -528,7 +331,6 @@ class EpisodeRunner:
 
                 final_reward = np.zeros(1, dtype=np.float32)
                 sim_score = 0
-                episode_metrics = None
                 if done:
                     env_info = env_obs["observation"]["env_info"]
                     sim_score = env_info.get("total_score", 0)
@@ -546,80 +348,18 @@ class EpisodeRunner:
                     if self.eval_episode_cnt > 0:
                         eval_win_rate = self.eval_win_count / self.eval_episode_cnt
 
-                    curr_stage = self._get_curriculum_stage()
-                    curr_stage_name = self._get_curriculum_stage_name(curr_stage)
-
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} mode:{mode} map:{selected_map} "
-                        f"stage:{curr_stage}({curr_stage_name}) "
                         f"steps:{step} result:{result_str} sim_score:{sim_score:.1f} "
                         f"total_reward:{total_reward:.3f} eval_win_rate:{eval_win_rate:.2%}"
                     )
 
-                    if mode == "train":
-                        episode_metrics = self._build_episode_metrics(step=step, sim_score=sim_score)
-
-                        if self._use_curriculum_training():
-                            self.stage_metric_window.append(episode_metrics)
-                            self.stage_train_episode_cnt += 1
-
-                            self.logger.info(
-                                "[curriculum] stage=%d (%s) | "
-                                "stage_train_eps=%d | window=%d/%d | "
-                                "survival_rate=%.4f wall_collision_rate=%.4f "
-                                "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
-                                "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
-                                "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
-                                % (
-                                    self.curriculum_stage,
-                                    self._get_stage_name(),
-                                    self.stage_train_episode_cnt,
-                                    len(self.stage_metric_window),
-                                    self.curriculum_window_size,
-                                    episode_metrics["survival_rate"],
-                                    episode_metrics["wall_collision_rate"],
-                                    episode_metrics["illegal_action_rate"],
-                                    episode_metrics["blocked_after_legal_rate"],
-                                    episode_metrics["danger_penalty_per_step"],
-                                    episode_metrics["exploration_score"],
-                                    episode_metrics["idle_penalty_per_step"],
-                                    episode_metrics["dead_end_penalty_per_step"],
-                                    episode_metrics["treasure_count"],
-                                    episode_metrics["buff_count"],
-                                    episode_metrics["treasure_approach_reward"],
-                                    episode_metrics["sim_score"],
-                                )
-                            )
-
-                            self._maybe_advance_curriculum_stage()
-                        else:
-                            self.logger.info(
-                                "[direct_train] "
-                                "survival_rate=%.4f wall_collision_rate=%.4f "
-                                "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
-                                "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
-                                "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
-                                % (
-                                    episode_metrics["survival_rate"],
-                                    episode_metrics["wall_collision_rate"],
-                                    episode_metrics["illegal_action_rate"],
-                                    episode_metrics["blocked_after_legal_rate"],
-                                    episode_metrics["danger_penalty_per_step"],
-                                    episode_metrics["exploration_score"],
-                                    episode_metrics["idle_penalty_per_step"],
-                                    episode_metrics["dead_end_penalty_per_step"],
-                                    episode_metrics["treasure_count"],
-                                    episode_metrics["buff_count"],
-                                    episode_metrics["treasure_approach_reward"],
-                                    episode_metrics["sim_score"],
-                                )
-                            )
-
                 # 终局奖励并入训练用 reward，确保 GAE / PPO 直接学习到胜负信号。
-                shaped_reward = reward_for_current + final_reward
+                shaped_reward = (reward_for_current + final_reward) * Config.REWARD_SCALE
 
                 frame = SampleData(
                     obs=np.array(obs_data.feature, dtype=np.float32),
+                    next_obs=np.array(_obs_data.feature, dtype=np.float32),
                     legal_action=np.array(obs_data.legal_action, dtype=np.float32),
                     act=np.array([act_data.action[0]], dtype=np.float32),
                     reward=shaped_reward,
@@ -638,16 +378,11 @@ class EpisodeRunner:
 
                 if done:
                     now = time.time()
-
-                    # 如果你希望“每一局”都在面板上打一个点，就不要 60 秒节流
-                    if self.monitor:
+                    if now - self.last_report_monitor_time >= 60 and self.monitor:
                         env_info = env_obs["observation"].get("env_info", {})
                         train_pool_size = int(len(self.train_maps))
                         eval_pool_size = int(len(self.eval_maps))
                         configured_total_map = int(train_pool_size + eval_pool_size)
-
-                        curr_stage = self._get_curriculum_stage()
-
                         monitor_data = {
                             "reward": round(total_reward + float(final_reward[0]), 4),
                             "episode_steps": step,
@@ -655,27 +390,27 @@ class EpisodeRunner:
                             "sim_score": sim_score,
                             "mode": 1 if mode == "eval" else 0,
                             "map_id": selected_map,
-
-                            # total_map 展示为训练+评估地图总数（固定配置总量）
+                            # total_map展示为训练+评估地图总数（固定配置总量）
                             "total_map": configured_total_map,
-                            # 保留环境原始 total_map 便于排查（通常为单局传入 map 列表长度）
+                            # 保留环境原始total_map便于排查（通常为单局传入map列表长度）
                             "env_total_map": int(env_info.get("total_map", 0) or 0),
                             "train_map_pool_size": train_pool_size,
                             "eval_map_pool_size": eval_pool_size,
                             "configured_total_map": configured_total_map,
                         }
-
                         if mode == "train":
                             monitor_data["train_map_id"] = int(selected_map)
-                            monitor_data.update(self._get_reward_monitor_data())
-
-                        # 阶段进度指标：每局都可以上报
-                        monitor_data.update(self._get_curriculum_progress_monitor_data())
-
-                        # 阶段判定指标：只在 train 局上报，避免 eval 局补零污染折线图
-                        if mode == "train":
-                            monitor_data.update(self._get_curriculum_episode_monitor_data(episode_metrics))
-                        
+                        monitor_data.update(self._get_reward_monitor_data())
+                        consistency_total = float(
+                            self.reward_components.get("move_mask_consistency_total", 0.0)
+                        )
+                        consistency_hit = float(
+                            self.reward_components.get("move_mask_consistency_hit", 0.0)
+                        )
+                        monitor_data["move_mask_consistency_rate"] = round(
+                            (consistency_hit / consistency_total) if consistency_total > 1e-6 else 0.0,
+                            4,
+                        )
                         if self.eval_episode_cnt > 0:
                             monitor_data["eval_win_rate"] = round(
                                 self.eval_win_count / self.eval_episode_cnt, 4
