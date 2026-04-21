@@ -111,6 +111,9 @@ class EpisodeRunner:
             "late_survive_reward": 0.0,
             "danger_penalty": 0.0,
             "wall_collision_penalty": 0.0,
+            "is_illegal_action": 0.0,
+            "is_blocked_after_legal": 0.0,
+            "is_wall_collision": 0.0,
             "flash_fail_penalty": 0.0,
             "flash_escape_reward": 0.0,
             "flash_survival_reward": 0.0,
@@ -150,6 +153,15 @@ class EpisodeRunner:
         }
         return stage_name_map.get(int(stage), "unknown")
 
+    def _use_curriculum_training(self):
+        preprocessor = getattr(self.agent, "preprocessor", None)
+        if preprocessor is None:
+            return True
+        fn = getattr(preprocessor, "use_curriculum_training", None)
+        if callable(fn):
+            return bool(fn())
+        return True
+
     def _apply_curriculum_stage_to_agent(self):
         if hasattr(self.agent, "preprocessor") and self.agent.preprocessor is not None:
             self.agent.preprocessor.set_curriculum_stage(self.curriculum_stage)
@@ -185,11 +197,19 @@ class EpisodeRunner:
 
         survival_rate = self._safe_div(step, self.max_step, 0.0)
 
-        wall_collision_rate = self._safe_div(
-            self._estimate_event_count(rc.get("wall_collision_penalty", 0.0), "wall_collision_penalty", 0.1),
+        illegal_action_rate = self._safe_div(
+            rc.get("is_illegal_action", 0.0),
             step,
             0.0,
         )
+
+        blocked_after_legal_rate = self._safe_div(
+            rc.get("is_blocked_after_legal", 0.0),
+            step,
+            0.0,
+        )
+
+        wall_collision_rate = illegal_action_rate + blocked_after_legal_rate
 
         danger_penalty_per_step = self._safe_div(
             abs(rc.get("danger_penalty", 0.0)),
@@ -226,6 +246,8 @@ class EpisodeRunner:
         return {
             "survival_rate": float(survival_rate),
             "wall_collision_rate": float(wall_collision_rate),
+            "illegal_action_rate": float(illegal_action_rate),
+            "blocked_after_legal_rate": float(blocked_after_legal_rate),
             "danger_penalty_per_step": float(danger_penalty_per_step),
             "idle_penalty_per_step": float(idle_penalty_per_step),
             "dead_end_penalty_per_step": float(dead_end_penalty_per_step),
@@ -255,6 +277,8 @@ class EpisodeRunner:
         for k in [
             "survival_rate",
             "wall_collision_rate",
+            "illegal_action_rate",
+            "blocked_after_legal_rate",
             "danger_penalty_per_step",
             "idle_penalty_per_step",
             "dead_end_penalty_per_step",
@@ -272,6 +296,9 @@ class EpisodeRunner:
         return float(np.mean([m.get(name, 0.0) for m in self.stage_metric_window]))
 
     def _check_stage_transition_ready(self):
+        if not self._use_curriculum_training():
+            return False, {}
+
         if self.curriculum_stage >= 4:
             return False, {}
         if self.stage_train_episode_cnt < self.curriculum_min_train_episodes:
@@ -282,6 +309,8 @@ class EpisodeRunner:
         avg_metrics = {
             "survival_rate": self._mean_metric("survival_rate"),
             "wall_collision_rate": self._mean_metric("wall_collision_rate"),
+            "illegal_action_rate": self._mean_metric("illegal_action_rate"),
+            "blocked_after_legal_rate": self._mean_metric("blocked_after_legal_rate"),
             "danger_penalty_per_step": self._mean_metric("danger_penalty_per_step"),
             "idle_penalty_per_step": self._mean_metric("idle_penalty_per_step"),
             "dead_end_penalty_per_step": self._mean_metric("dead_end_penalty_per_step"),
@@ -356,7 +385,8 @@ class EpisodeRunner:
 
         self.logger.info(
             "[curriculum] stage advance: %d -> %d (%s) | "
-            "survival_rate=%.4f wall_collision_rate=%.4f danger_per_step=%.4f "
+            "survival_rate=%.4f wall_collision_rate=%.4f "
+            "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
             "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
             "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
             % (
@@ -365,6 +395,8 @@ class EpisodeRunner:
                 self._get_stage_name(),
                 avg_metrics.get("survival_rate", 0.0),
                 avg_metrics.get("wall_collision_rate", 0.0),
+                avg_metrics.get("illegal_action_rate", 0.0),
+                avg_metrics.get("blocked_after_legal_rate", 0.0),
                 avg_metrics.get("danger_penalty_per_step", 0.0),
                 avg_metrics.get("exploration_score", 0.0),
                 avg_metrics.get("idle_penalty_per_step", 0.0),
@@ -526,35 +558,62 @@ class EpisodeRunner:
 
                     if mode == "train":
                         episode_metrics = self._build_episode_metrics(step=step, sim_score=sim_score)
-                        self.stage_metric_window.append(episode_metrics)
-                        self.stage_train_episode_cnt += 1
 
-                        self.logger.info(
-                            "[curriculum] stage=%d (%s) | "
-                            "stage_train_eps=%d | window=%d/%d | "
-                            "survival_rate=%.4f wall_collision_rate=%.4f danger_per_step=%.4f "
-                            "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
-                            "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
-                            % (
-                                self.curriculum_stage,
-                                self._get_stage_name(),
-                                self.stage_train_episode_cnt,
-                                len(self.stage_metric_window),
-                                self.curriculum_window_size,
-                                episode_metrics["survival_rate"],
-                                episode_metrics["wall_collision_rate"],
-                                episode_metrics["danger_penalty_per_step"],
-                                episode_metrics["exploration_score"],
-                                episode_metrics["idle_penalty_per_step"],
-                                episode_metrics["dead_end_penalty_per_step"],
-                                episode_metrics["treasure_count"],
-                                episode_metrics["buff_count"],
-                                episode_metrics["treasure_approach_reward"],
-                                episode_metrics["sim_score"],
+                        if self._use_curriculum_training():
+                            self.stage_metric_window.append(episode_metrics)
+                            self.stage_train_episode_cnt += 1
+
+                            self.logger.info(
+                                "[curriculum] stage=%d (%s) | "
+                                "stage_train_eps=%d | window=%d/%d | "
+                                "survival_rate=%.4f wall_collision_rate=%.4f "
+                                "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
+                                "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
+                                "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
+                                % (
+                                    self.curriculum_stage,
+                                    self._get_stage_name(),
+                                    self.stage_train_episode_cnt,
+                                    len(self.stage_metric_window),
+                                    self.curriculum_window_size,
+                                    episode_metrics["survival_rate"],
+                                    episode_metrics["wall_collision_rate"],
+                                    episode_metrics["illegal_action_rate"],
+                                    episode_metrics["blocked_after_legal_rate"],
+                                    episode_metrics["danger_penalty_per_step"],
+                                    episode_metrics["exploration_score"],
+                                    episode_metrics["idle_penalty_per_step"],
+                                    episode_metrics["dead_end_penalty_per_step"],
+                                    episode_metrics["treasure_count"],
+                                    episode_metrics["buff_count"],
+                                    episode_metrics["treasure_approach_reward"],
+                                    episode_metrics["sim_score"],
+                                )
                             )
-                        )
 
-                        self._maybe_advance_curriculum_stage()
+                            self._maybe_advance_curriculum_stage()
+                        else:
+                            self.logger.info(
+                                "[direct_train] "
+                                "survival_rate=%.4f wall_collision_rate=%.4f "
+                                "illegal_action_rate=%.4f blocked_after_legal_rate=%.4f danger_per_step=%.4f "
+                                "exploration_score=%.4f idle_per_step=%.4f dead_end_per_step=%.4f "
+                                "treasure_count=%.4f buff_count=%.4f treasure_approach=%.4f sim_score=%.4f"
+                                % (
+                                    episode_metrics["survival_rate"],
+                                    episode_metrics["wall_collision_rate"],
+                                    episode_metrics["illegal_action_rate"],
+                                    episode_metrics["blocked_after_legal_rate"],
+                                    episode_metrics["danger_penalty_per_step"],
+                                    episode_metrics["exploration_score"],
+                                    episode_metrics["idle_penalty_per_step"],
+                                    episode_metrics["dead_end_penalty_per_step"],
+                                    episode_metrics["treasure_count"],
+                                    episode_metrics["buff_count"],
+                                    episode_metrics["treasure_approach_reward"],
+                                    episode_metrics["sim_score"],
+                                )
+                            )
 
                 # 终局奖励并入训练用 reward，确保 GAE / PPO 直接学习到胜负信号。
                 shaped_reward = reward_for_current + final_reward

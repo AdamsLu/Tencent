@@ -176,10 +176,13 @@ class Preprocessor:
                 "normal_move_step": 1,
                 "buff_move_step": 2,
                 "danger_threshold_steps": 6.0,
-                # 与环境动作表一致：
-                # 直线闪现 10 格；对角闪现 8 格
                 "flash_step_cardinal": 10,
                 "flash_step_diagonal": 8,
+            },
+            "training": {
+                # True: 按阶段训练
+                # False: 直接训练（忽略阶段奖励表，只看各 reward.enable）
+                "use_curriculum": True,
             },
             "survive_reward": {"enable": True, "coef": 0.02},
             "treasure_reward": {"enable": True, "coef": 1.0},
@@ -187,7 +190,7 @@ class Preprocessor:
             "treasure_approach_reward": {"enable": True, "coef": 0.08},
             "speed_buff_approach_reward": {"enable": True, "coef": 0.05},
             "monster_dist_shaping": {"enable": True, "coef": 0.12},
-            "wall_collision_penalty": {"enable": True, "coef": -0.05},
+            "wall_collision_penalty": {"enable": False, "coef": -0.05},
             "exploration_reward": {"enable": True, "coef_per_cell": 0.0005},
             "idle_wander_penalty": {"enable": True, "coef": -0.02},
         }
@@ -240,6 +243,9 @@ class Preprocessor:
         return int(getattr(self, "curriculum_stage", 1))
 
     def get_curriculum_stage_name(self) -> str:
+        if not self.use_curriculum_training():
+            return "direct_train"
+
         mapping = {
             1: "survival_base",
             2: "explore_and_stabilize",
@@ -251,21 +257,35 @@ class Preprocessor:
     def get_reward_term_coef(self, section: str, key: str = "coef", default: float = 1.0) -> float:
         return float(self._cfg(section, key, default))
 
+    def use_curriculum_training(self) -> bool:
+        return bool(self._cfg("training", "use_curriculum", True))
+
+    def _reward_cfg_enabled(self, name: str) -> bool:
+        return bool(self._cfg(name, "enable", True))
+
     def _is_stage_enabled(self, name: str) -> bool:
+        # 先看 reward_conf.toml 里的总开关
+        cfg_on = self._reward_cfg_enabled(name)
+        if not cfg_on:
+            return False
+
+        # 如果不按阶段训练，则只看 enable，不看阶段表
+        if not self.use_curriculum_training():
+            return True
+
+        # 按阶段训练时：阶段表 AND enable
         stage = self.get_curriculum_stage()
         stage_reward_map = {
-            1: {"survive_reward", "monster_dist_shaping", "wall_collision_penalty"},
+            1: {"survive_reward", "monster_dist_shaping"},
             2: {
                 "survive_reward",
                 "monster_dist_shaping",
-                "wall_collision_penalty",
                 "exploration_reward",
                 "idle_wander_penalty",
             },
             3: {
                 "survive_reward",
                 "monster_dist_shaping",
-                "wall_collision_penalty",
                 "exploration_reward",
                 "idle_wander_penalty",
                 "treasure_reward",
@@ -276,7 +296,6 @@ class Preprocessor:
             4: {
                 "survive_reward",
                 "monster_dist_shaping",
-                "wall_collision_penalty",
                 "exploration_reward",
                 "idle_wander_penalty",
                 "treasure_reward",
@@ -288,6 +307,8 @@ class Preprocessor:
         return name in stage_reward_map.get(stage, stage_reward_map[1])
 
     def _is_survival_only_stage(self) -> bool:
+        if not self.use_curriculum_training():
+            return False
         return self.get_curriculum_stage() <= 2
 
     def reset(self) -> None:
@@ -320,6 +341,8 @@ class Preprocessor:
         self.prev_simulated_next_positions = None
         self.prev_move_mask_debug = None
         self.prev_map_info_debug = None
+        self.prev_raw_hero_debug = None
+        self.prev_raw_env_info_debug = None
 
     # ---------------------------------------------------------------------
     # 协议解析辅助：尽量兼容不同 env_obs 结构
@@ -339,35 +362,72 @@ class Preprocessor:
         return default
 
     def _extract_hero(self, env_obs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        更稳地提取 hero。
+        关键修复：
+        1) 优先支持 heroes / frame_state.heroes / observation.frame_state.heroes
+        2) 若命中的是 list，则选第一个带合法 pos 的对象
+        3) 尽量不要再用“第一个带 pos 的 dict”这种高风险兜底
+        """
         hero = self._get_from_paths(
             env_obs,
             [
+                ("heroes",),
                 ("hero",),
                 ("player",),
                 ("player_state",),
+
+                ("frame_state", "heroes"),
                 ("frame_state", "hero"),
                 ("frame_state", "player"),
                 ("frame_state", "player_state"),
+
+                ("observation", "heroes"),
                 ("observation", "hero"),
+                ("observation", "player"),
+                ("observation", "player_state"),
+
+                ("observation", "frame_state", "heroes"),
+                ("observation", "frame_state", "hero"),
+                ("observation", "frame_state", "player"),
+                ("observation", "frame_state", "player_state"),
+
+                ("obs", "heroes"),
                 ("obs", "hero"),
+                ("obs", "player"),
+                ("obs", "player_state"),
             ],
             default=None,
         )
-        if hero is None:
-            # 兜底：找到第一个带 pos 的 dict。
-            stack = [env_obs]
-            while stack:
-                cur = stack.pop()
-                if isinstance(cur, dict):
-                    if isinstance(cur.get("pos"), dict) and "x" in cur["pos"] and "z" in cur["pos"]:
-                        hero = cur
-                        break
-                    stack.extend(cur.values())
-                elif isinstance(cur, list):
-                    stack.extend(cur)
+
+        # heroes 可能是 list
+        if isinstance(hero, list):
+            hero_candidates = []
+            for item in hero:
+                if not isinstance(item, dict):
+                    continue
+                pos = item.get("pos", {})
+                if isinstance(pos, dict) and "x" in pos and "z" in pos:
+                    hero_candidates.append(item)
+
+            hero = hero_candidates[0] if hero_candidates else None
+
+        # 若是 dict，但没有 pos，则视为无效
+        if isinstance(hero, dict):
+            pos = hero.get("pos", {})
+            if not (isinstance(pos, dict) and "x" in pos and "z" in pos):
+                hero = None
+
+        # 不再盲目使用“第一个带 pos 的 dict”兜底
         if not isinstance(hero, dict):
-            hero = {}
-        hero.setdefault("pos", {"x": 0, "z": 0})
+            print("[hero_extract_warning] failed to locate real hero, fallback to zero pos")
+            hero = {"pos": {"x": 0, "z": 0}}
+
+        print(
+            "[hero_extract_debug]",
+            "hero_keys=", list(hero.keys()) if isinstance(hero, dict) else None,
+            "hero=", hero,
+        )
         return hero
 
     def _extract_monsters(self, env_obs: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -523,6 +583,84 @@ class Preprocessor:
             default=False,
         )
         return bool(terminated), bool(truncated)
+
+    def _extract_env_legal_action(self, env_obs: Dict[str, Any]) -> Optional[List[int]]:
+        """
+        读取环境原生 legal_action。
+
+        目标输出长度固定为 16：
+        - 前 8 个：移动
+        - 后 8 个：闪现
+
+        若找不到或格式异常，则返回 None。
+        """
+        raw_legal_action = self._get_from_paths(
+            env_obs,
+            [
+                ("legal_action",),
+                ("frame_state", "legal_action"),
+                ("observation", "legal_action"),
+                ("observation", "frame_state", "legal_action"),
+                ("obs", "legal_action"),
+            ],
+            default=None,
+        )
+
+        if raw_legal_action is None:
+            return None
+
+        try:
+            arr = np.array(raw_legal_action, dtype=np.int32).reshape(-1)
+        except Exception:
+            return None
+
+        if arr.size < 16:
+            return None
+
+        arr = arr[:16]
+        arr = (arr > 0).astype(np.int32)
+        return arr.tolist()
+
+    def _debug_compare_legal_action(
+        self,
+        hero_pos: Dict[str, int],
+        self_legal_action: Sequence[int],
+        env_legal_action: Optional[Sequence[int]],
+        final_legal_action: Sequence[int],
+        every_n_steps: int = 1,
+    ) -> None:
+        """
+        打印：
+        - 自己算的 mask
+        - 环境原生 mask
+        - 最终取交集后的 mask
+        - 两者不一致的位置
+        """
+        if every_n_steps <= 0:
+            every_n_steps = 1
+        if (self.step_count % every_n_steps) != 0:
+            return
+
+        self_arr = np.array(self_legal_action, dtype=np.int32).reshape(-1)
+        final_arr = np.array(final_legal_action, dtype=np.int32).reshape(-1)
+
+        env_arr = None
+        if env_legal_action is not None:
+            env_arr = np.array(env_legal_action, dtype=np.int32).reshape(-1)
+
+        mismatch_idx = []
+        if env_arr is not None and env_arr.shape == self_arr.shape:
+            mismatch_idx = np.where(self_arr != env_arr)[0].tolist()
+
+        print(
+            "[legal_action_compare]",
+            "step=", self.step_count,
+            "hero_pos=", hero_pos,
+            "self_legal_action=", self_arr.tolist(),
+            "env_legal_action=", None if env_arr is None else env_arr.tolist(),
+            "final_legal_action=", final_arr.tolist(),
+            "mismatch_idx=", mismatch_idx,
+        )
 
     def _hero_pos(self, hero: Dict[str, Any]) -> Dict[str, int]:
         pos = hero.get("pos", {}) if isinstance(hero, dict) else {}
@@ -2052,6 +2190,9 @@ class Preprocessor:
             "speed_buff_approach_reward": 0.0,
             "monster_dist_shaping": 0.0,
             "wall_collision_penalty": 0.0,
+            "is_illegal_action": 0.0,
+            "is_blocked_after_legal": 0.0,
+            "is_wall_collision": 0.0,
             "exploration_reward": 0.0,
             "idle_wander_penalty": 0.0,
         }
@@ -2076,7 +2217,7 @@ class Preprocessor:
             and has_speed_buff
             and (not self.prev_has_speed_buff)
         ):
-            reward_terms["speed_buff_reward"] = float(self._cfg("speed_buff_reward", "coef", 0.25))
+            reward_terms["speed_buff_reward"] = float(self._cfg("speed_buff_reward", "coef", 1))
         self.prev_has_speed_buff = has_speed_buff
 
         # 4) 沿路距离 shaping：宝箱 / buff / 怪物
@@ -2105,17 +2246,17 @@ class Preprocessor:
             if self.prev_nearest_buff_path_dist is not None and cur_buff_dist is not None:
                 delta = float(self.prev_nearest_buff_path_dist - cur_buff_dist)
                 reward_terms["speed_buff_approach_reward"] = float(
-                    self._cfg("speed_buff_approach_reward", "coef", 0.05)
+                    self._cfg("speed_buff_approach_reward", "coef", 0.1)
                 ) * _clip_delta(delta)
         self.prev_nearest_buff_path_dist = cur_buff_dist
 
         if self._is_stage_enabled("monster_dist_shaping"):
             coef = float(self._cfg("monster_dist_shaping", "coef", 0.12))
 
-            # A. 有可靠距离时，继续用距离 shaping
+            # A. 有可靠距离时，不再裁切，直接使用距离变化量
             if self.prev_nearest_monster_path_dist is not None and cur_monster_dist is not None:
                 delta = float(cur_monster_dist - self.prev_nearest_monster_path_dist)
-                reward_terms["monster_dist_shaping"] = coef * _clip_delta(delta)
+                reward_terms["monster_dist_shaping"] = coef * delta
 
             # B. 视野外只有方向时，只给“背离怪物方向”的奖励
             elif monster_dist_mode == "out_of_view_direction_only":
@@ -2142,35 +2283,31 @@ class Preprocessor:
         enabled = self._is_stage_enabled("monster_dist_shaping")
         coef = float(self._cfg("monster_dist_shaping", "coef", 0.12))
 
-
-
         if enabled:
             if self.prev_nearest_monster_path_dist is not None and cur_monster_dist is not None:
                 delta = float(cur_monster_dist - self.prev_nearest_monster_path_dist)
-                clipped = _clip_delta(delta)
                 print(
                     "[monster_dist_shaping detail]",
                     "delta=", delta,
-                    "clipped=", clipped,
-                    "reward=", coef * clipped,
+                    "reward=", coef * delta,
                 )
 
         # 5) 撞墙 / 无效移动惩罚
-        if self._is_stage_enabled("wall_collision_penalty") and last_action is not None and 0 <= int(last_action) < 8:
+        if last_action is not None and 0 <= int(last_action) < 8:
             prev_mask_val = None
             if (
                 self.prev_legal_action_for_last_action is not None
                 and int(last_action) < len(self.prev_legal_action_for_last_action)
             ):
                 prev_mask_val = int(self.prev_legal_action_for_last_action[int(last_action)])
-            
+
             prev_sim_target = None
             if (
                 self.prev_simulated_next_positions is not None
                 and 0 <= int(last_action) < len(self.prev_simulated_next_positions)
             ):
                 prev_sim_target = self.prev_simulated_next_positions[int(last_action)]
-            
+
             moved = None
             if self.prev_hero_pos is not None:
                 moved = (
@@ -2178,8 +2315,23 @@ class Preprocessor:
                     int(hero_pos["z"]) != int(self.prev_hero_pos["z"])
                 )
 
+            is_illegal_action = 0.0
+            is_blocked_after_legal = 0.0
+
+            # A. 上一步动作在“上一步 mask”里就非法
+            if prev_mask_val == 0:
+                is_illegal_action = 1.0
+
+            # B. 上一步动作在 mask 中合法，但执行后没动
+            elif prev_mask_val == 1 and self.prev_hero_pos is not None and moved is False:
+                is_blocked_after_legal = 1.0
+
+            reward_terms["is_illegal_action"] = float(is_illegal_action)
+            reward_terms["is_blocked_after_legal"] = float(is_blocked_after_legal)
+            reward_terms["is_wall_collision"] = float(is_illegal_action + is_blocked_after_legal)
+
             print(
-                "[wall_penalty_debug_fixed]",
+                "[wall_collision_split_debug]",
                 "step=", self.step_count,
                 "last_action=", last_action,
                 "prev_mask_val=", prev_mask_val,
@@ -2187,7 +2339,11 @@ class Preprocessor:
                 "prev_hero_pos=", self.prev_hero_pos,
                 "hero_pos=", hero_pos,
                 "moved=", moved,
+                "is_illegal_action=", reward_terms["is_illegal_action"],
+                "is_blocked_after_legal=", reward_terms["is_blocked_after_legal"],
+                "is_wall_collision=", reward_terms["is_wall_collision"],
             )
+
             if prev_mask_val == 1 and moved is False:
                 self._debug_stuck_move_case(
                     prev_hero_pos=self.prev_hero_pos,
@@ -2195,19 +2351,23 @@ class Preprocessor:
                     prev_sim_target=prev_sim_target,
                     prev_map_info=self.prev_map_info_debug,
                 )
+                print(
+                    "[hero_state_when_blocked]",
+                    "step=", self.step_count,
+                    "last_action=", last_action,
+                    "prev_raw_hero=", self.prev_raw_hero_debug,
+                    "prev_raw_env_info=", self.prev_raw_env_info_debug,
+                    "curr_raw_hero=", hero,
+                    "curr_raw_env_info=", env_info,
+                )
 
-            # A. 上一步动作在“上一步 mask”里就非法
-            if prev_mask_val == 0:
+            # 惩罚项是否启用，与统计解耦
+            if self._is_stage_enabled("wall_collision_penalty") and reward_terms["is_wall_collision"] > 0.5:
                 reward_terms["wall_collision_penalty"] = float(
                     self._cfg("wall_collision_penalty", "coef", -0.05)
                 )
 
-            # B. 上一步动作虽合法，但执行后没动
-            elif self.prev_hero_pos is not None:
-                if not moved:
-                    reward_terms["wall_collision_penalty"] = float(
-                        self._cfg("wall_collision_penalty", "coef", -0.05)
-                    )
+            if moved is not None:
                 self.prev_move_succeeded = bool(moved)
 
         # 6) 开图奖励
@@ -2239,6 +2399,12 @@ class Preprocessor:
         prev_sim_target: Optional[Dict[str, Any]],
         prev_map_info: Optional[List[List[int]]],
     ) -> None:
+        """
+        当出现：
+        - 上一帧动作在 mask 中合法
+        - 但 env 执行后 hero 没动
+        时，打印上一帧局部地图的关键信息，验证本地 mask 逻辑是否自洽。
+        """
         if prev_map_info is None or prev_sim_target is None:
             print("[stuck_case_debug] prev_map_info or prev_sim_target is None")
             return
@@ -2249,9 +2415,9 @@ class Preprocessor:
             return
 
         rows, cols = arr.shape
-        cr, cc = rows // 2, cols // 2
+        cr, cc = rows // 2, cols // 2   # 21x21 的中心点，一般就是 (10,10)
 
-        # 与 _simulate_next_position 保持一致
+        # 与 _simulate_next_position 完全一致的方向定义
         action_delta = [
             (1, 0),    # 0 E
             (1, -1),   # 1 NE
@@ -2263,6 +2429,8 @@ class Preprocessor:
             (1, 1),    # 7 SE
         ]
         dx, dz = action_delta[int(last_action)]
+
+        # 目标格在局部图中的坐标
         tr, tc = cr + dz, cc + dx
 
         info = {
@@ -2285,15 +2453,16 @@ class Preprocessor:
         info["center_cell"] = get_cell(cr, cc)
         info["target_cell"] = get_cell(tr, tc)
 
-        # 对角动作时，把两侧切角格也打印出来
+        # 若是对角动作，再打印两侧切角格
         if dx != 0 and dz != 0:
-            side1 = (cr + dz, cc)
-            side2 = (cr, cc + dx)
+            side1 = (cr + dz, cc)   # 纵向相邻格
+            side2 = (cr, cc + dx)   # 横向相邻格
             info["side1_rc"] = side1
             info["side1_cell"] = get_cell(*side1)
             info["side2_rc"] = side2
             info["side2_cell"] = get_cell(*side2)
 
+        # 打印以中心点为核心的 5x5 patch
         patch = []
         for r in range(cr - 2, cr + 3):
             row = []
@@ -2419,7 +2588,29 @@ class Preprocessor:
         has_speed_buff = self._has_speed_buff(hero, env_info)
         move_mask = self._preprocess_move_action_mask(map_info, has_speed_buff)
         flash_mask = self._preprocess_flash_action_mask(map_info, self._flash_cd_norm(hero, env_info))
-        legal_action = list(move_mask) + list(flash_mask)
+
+        # 自己基于局部地图/规则计算的 mask
+        self_legal_action = list(move_mask) + list(flash_mask)
+
+        # 环境原生 legal_action
+        env_legal_action = self._extract_env_legal_action(env_obs)
+
+        # 最终 mask：优先取交集
+        if env_legal_action is not None and len(env_legal_action) >= 16:
+            legal_action = [
+                int(self_legal_action[i]) & int(env_legal_action[i])
+                for i in range(16)
+            ]
+        else:
+            legal_action = list(self_legal_action)
+
+        self._debug_compare_legal_action(
+            hero_pos=hero_pos,
+            self_legal_action=self_legal_action,
+            env_legal_action=env_legal_action,
+            final_legal_action=legal_action,
+            every_n_steps=1,
+        )
 
         simulated_next_positions = []
         for a in range(8):
@@ -2441,7 +2632,9 @@ class Preprocessor:
             "last_action=", last_action,
             "move_mask=", move_mask,
             "flash_mask=", flash_mask,
-            "legal_action=", legal_action,
+            "self_legal_action=", self_legal_action,
+            "env_legal_action=", env_legal_action,
+            "final_legal_action=", legal_action,
             "simulated_next_positions=", simulated_next_positions,
         )
 
@@ -2495,9 +2688,10 @@ class Preprocessor:
         self.prev_move_mask_for_last_action = list(move_mask)
         self.prev_flash_mask_for_last_action = list(flash_mask)
         self.prev_legal_action_for_last_action = list(legal_action)
-        self.prev_legal_action_for_last_action = list(legal_action)
         self.prev_simulated_next_positions = copy.deepcopy(simulated_next_positions)
         self.prev_move_mask_debug = list(move_mask)
         self.prev_map_info_debug = copy.deepcopy(map_info)
+        self.prev_raw_hero_debug = copy.deepcopy(hero)
+        self.prev_raw_env_info_debug = copy.deepcopy(env_info)
         self.step_count += 1
         return feature, legal_action, reward

@@ -203,13 +203,33 @@ def build_monitor():
         )
         .end_panel()
         .add_panel(
-            name="撞墙惩罚",
-            name_en="wall_collision_penalty",
+            name="非法动作事件",
+            name_en="is_illegal_action",
             type="line",
         )
         .add_metric(
-            metrics_name="wall_collision_penalty",
-            expr="avg(wall_collision_penalty{})",
+            metrics_name="is_illegal_action",
+            expr="avg(is_illegal_action{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="合法但未位移事件",
+            name_en="is_blocked_after_legal",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="is_blocked_after_legal",
+            expr="avg(is_blocked_after_legal{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="总碰撞事件",
+            name_en="is_wall_collision",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="is_wall_collision",
+            expr="avg(is_wall_collision{})",
         )
         .end_panel()
         .add_panel(
@@ -526,6 +546,27 @@ def build_monitor():
         .add_metric(
             metrics_name="wall_collision_rate",
             expr="avg(wall_collision_rate{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="非法动作率",
+            name_en="illegal_action_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="illegal_action_rate",
+            expr="avg(illegal_action_rate{})",
+        )
+        .end_panel()
+
+        .add_panel(
+            name="合法但未位移率",
+            name_en="blocked_after_legal_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="blocked_after_legal_rate",
+            expr="avg(blocked_after_legal_rate{})",
         )
         .end_panel()
 
