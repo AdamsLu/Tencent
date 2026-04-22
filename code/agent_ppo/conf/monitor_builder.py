@@ -70,7 +70,11 @@ def build_monitor():
         ("无移动次数", "no_movement_case"),
         ("MoveMask一致率", "move_mask_consistency_rate"),
         ("开图率", "explore_rate"),
-        ("该闪不闪惩罚","flash_hold_penalty")
+        ("该闪不闪惩罚","flash_hold_penalty"),
+        ("buff浪费惩罚","buff_opportunity_cost_penalty"),
+        ("无危险滥用闪现惩罚","flash_abuse_penalty_non_danger"),
+        ("危险区滞留步数","danger_hold_steps"),
+        ("闪现穿墙奖励","flash_through_wall_reward")
     ]
     for panel_name, metric_name in reward_panels:
         monitor.add_panel(name=panel_name, name_en=metric_name, type="line")

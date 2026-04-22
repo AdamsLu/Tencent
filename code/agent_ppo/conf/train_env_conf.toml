@@ -32,15 +32,15 @@ buff_cooldown = 200
 
 # Talent skill cooldown in steps. The skill enters cooldown after being cast. Range: 50~2000.
 # 技能冷却步数。技能在被施放后会进入冷却状态，冷却状态结束后重新激活。可配置范围为50～2000。
-talent_cooldown = 100
+talent_cooldown = 150
 
 # Steps before the second monster appears. Range: -1, 11~2000. -1 means random within 11~2000.
 # 第二个怪物出现间隔。即预测多少步后，出现第二个怪物。可配置范围为-1,11～2000。-1即为在11～2000范围内随机生成对应配置。
-monster_interval = 300
+monster_interval = 200
 
 # Steps before monster speed increases by one grid. Range: -1, 1~2000. -1 means random within 1~2000.
 # 怪物加速增益时间。即开局多少步后，怪物移动速度增加一格。可配置范围-1,1～2000。-1即为在1～2000范围内随机生成对应配置。
-monster_speedup = 500
+monster_speedup = 400
 
 # Maximum steps per episode. The episode ends when this limit is reached. Range: 1~2000.
 # 最大步数。单局任务预测步数达到最大步数时，任务结束。可配置范围为1～2000。

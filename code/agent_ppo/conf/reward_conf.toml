@@ -44,6 +44,10 @@ second_monster_spawn_mult = 1.2
 first_monster_speedup_mult = 1.5
 second_monster_speedup_mult = 2
 
+[reward.buff_overlap_penalty]
+enable = true
+coef = -100
+
 [reward.speed_buff_approach_reward]
 enable = true
 coef = 1
@@ -86,7 +90,7 @@ enable = true
 coef = -0.1
 
 [reward.flash_fail_penalty]
-enable = true
+enable = false
 coef = -0.15
 
 [reward.flash_escape_reward]
@@ -110,6 +114,7 @@ caught_decay_min_step = 1
 caught_decay_max_step = 15
 caught_coef_start = -10.0
 caught_coef_end = -1.0
+non_danger_flash_coef = -20
 
 [reward.speed_buff_escape_reward]
 enable = true
@@ -151,3 +156,7 @@ second_monster_speedup_mult = 3
 enable = true
 first_visit = 0.3
 second_visit = 0.1
+
+[reward.flash_through_wall_reward]
+enable = true
+coef = 50

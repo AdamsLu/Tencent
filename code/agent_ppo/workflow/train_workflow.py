@@ -100,6 +100,7 @@ class EpisodeRunner:
             "survive_reward": 0.0,
             "treasure_reward": 0.0,
             "speed_buff_reward": 0.0,
+            "buff_overlap_penalty": 0.0,
             "speed_buff_approach_reward": 0.0,
             "treasure_approach_reward": 0.0,
             "monster_dist_shaping": 0.0,
@@ -121,6 +122,11 @@ class EpisodeRunner:
             "centroid_away_reward": 0.0,
             "idle_wander_penalty": 0.0,
             "dead_end_penalty": 0.0,
+            "flash_hold_penalty": 0.0,
+            "buff_opportunity_cost_penalty": 0.0,
+            "flash_abuse_penalty_non_danger": 0.0,
+            "danger_hold_steps": 0.0,
+            "flash_through_wall_reward":0.0
         }
         # 开图率相关：使用“最后一步值”而不是累加
         self.explore_rate = 0.0

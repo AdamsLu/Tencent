@@ -720,11 +720,21 @@ class Preprocessor:
             "wall_collision_penalty": {"enable": True, "coef": -0.1},
             "flash_fail_penalty": {"enable": True, "coef": -0.15},
             "flash_hold_penalty": {
+                # 1) 两段式危险窗口惩罚（不扩大危险半径）
                 "enable": True,
-                "coef": -0.03,                 # 轻惩罚
-                "min_monster_dist_margin": 0.0,# 可选安全余量
-                "require_flash_ready": True,   # 要求CD好
-                "apply_only_train": True,      # 仅训练期生效（推荐）
+                "require_flash_ready": True,
+                "apply_only_train": True,
+
+                # A. 入圈瞬时惩罚（刚进危险圈且不闪）
+                "entry_coef": -0.16,
+
+                # B. 圈内持续惩罚（随连续步增长）
+                "hold_base_coef": -0.02,
+                "hold_growth": 0.25,
+                "hold_max_abs": 0.08,  # 最大绝对值封顶（最终最小到 -0.08）
+
+                # C. 圈内不闪且未拉开距离的附加惩罚
+               "no_improve_extra_coef": -0.02,
             },
             "flash_escape_reward": {
                 "enable": True,
@@ -741,10 +751,38 @@ class Preprocessor:
                 "dist_delta_coef": 0.1,
             },
             "flash_abuse_penalty": {
+                # 5) 重构为“行为型不乱闪约束”
                 "enable": True,
+
+                # 非危险状态下闪现：直接惩罚
+                "non_danger_flash_coef": -0.12,
+
+                # 保留：安全区闪现且没拿到宝箱
+                "safe_zone_no_treasure_coef": -0.10,
+
+                # 关闭 caught 分支（高方差、延迟归因）
                 "caught_within_steps": 10,
-                "caught_coef": -1.0,
-                "safe_zone_no_treasure_coef": -1.0,
+                "caught_coef": 0.0,
+                "caught_decay_enable": False,
+                "caught_coef_start": 0.0,
+                "caught_coef_end": 0.0,
+                "caught_decay_min_step": 1,
+                "caught_decay_max_step": 15,
+            },
+            "exploration_control": {
+                # 2) 训练期闪现探索兜底（仅训练）
+                "enable_train_flash_explore_fallback": True,
+                "train_flash_explore_prob": 0.03,  # 建议 0.02~0.05
+            },
+
+            "buff_opportunity_cost_penalty": {
+                # 3) 持有buff时追buff的稠密机会成本惩罚
+                "enable": True,
+                "apply_only_train": True,
+                "coef": -0.06,           # 惩罚 = coef * (last_dist - cur_dist)_+
+                "delta_eps": 1e-6,
+                "disable_when_in_danger": True,
+                "disable_when_treasure_gain": True,
             },
             "safe_zone_reward": {
                 "enable": True,
@@ -773,6 +811,10 @@ class Preprocessor:
                 "second_monster_spawn_mult": 1.0,
                 "first_monster_speedup_mult": 1.0,
                 "second_monster_speedup_mult": 1.0,
+            },
+            "flash_through_wall_reward": {
+                "enable": True,
+                "coef": 50,            # 穿墙基础奖励，建议 0.05~0.15
             },
         }
 
@@ -879,7 +921,9 @@ class Preprocessor:
         self.speed_buff_escape_decay = 0.0
         # 上一帧是否持有加速buff（用于检测buff获取时刻）
         self.last_had_speed_buff = False
-
+        # ========== 危险窗口（该闪不闪）状态 ==========
+        self.prev_in_danger = False
+        self.danger_hold_steps = 0
         # ========== 闪现失败检测状态 ==========
         # 上一帧使用的闪现动作ID（用于计算期望闪现距离）
         self.last_flash_action = -1
@@ -1642,6 +1686,23 @@ class Preprocessor:
 
         for i in range(8):
             legal_action[8 + i] = int(new_flash[i])
+
+        # 2) 训练期探索兜底：当严格规则导致闪现全0时，给一个小概率放开1个基础合法方向
+        # 不改变危险半径规则，只用于训练期探索，eval不启用。
+        try:
+            if (
+                bool(self._cfg("exploration_control", "enable_train_flash_explore_fallback", True))
+                and self.episode_mode != "eval"
+                and sum(new_flash) == 0
+            ):
+                p = float(self._cfg("exploration_control", "train_flash_explore_prob", 0.03))
+                if np.random.rand() < max(0.0, min(1.0, p)):
+                    cand = [d for d in range(8) if flash_base[d] == 1]
+                    if cand:
+                        d = int(np.random.choice(cand))
+                        legal_action[8 + d] = 1
+        except Exception:
+            pass
 
         return legal_action
 
@@ -2425,7 +2486,7 @@ class Preprocessor:
                 self.episode_mode != "eval"
             ):
                 if bool(self.last_had_speed_buff):
-                    buff_overlap_penalty = float(self._cfg("buff_overlap_penalty", "coef", -0.1)) * float(buff_delta)
+                    buff_overlap_penalty = float(self._cfg("c", "coef", -1)) * float(buff_delta)
 
         # 4. 【稠密】加速buff靠近奖励 —— 仅计算最近加速buff，接近时给正向奖励
         speed_buff_approach_reward = 0.0
@@ -2448,6 +2509,43 @@ class Preprocessor:
             else:
                 self.last_speed_buff_potential = 0.0
                 self.last_speed_buff_potential_active = False
+
+        # 4.5 持有buff时追buff的稠密机会成本惩罚（训练期）
+        buff_opportunity_cost_penalty = 0.0
+        if self._cfg("buff_opportunity_cost_penalty", "enable", True):
+            if (not bool(self._cfg("buff_opportunity_cost_penalty", "apply_only_train", True))) or (self.episode_mode != "eval"):
+                disable_when_in_danger = bool(
+                    self._cfg("buff_opportunity_cost_penalty", "disable_when_in_danger", True)
+                )
+                disable_when_treasure_gain = bool(
+                    self._cfg("buff_opportunity_cost_penalty", "disable_when_treasure_gain", True)
+                )
+                delta_eps = float(self._cfg("buff_opportunity_cost_penalty", "delta_eps", 1e-6))
+
+                monster_speedup_local = env_info.get("monster_speedup", 500)
+                is_late_game_for_buff = self.step_no > monster_speedup_local
+
+                danger_threshold_local = float(self._global_cfg("danger_threshold", 0.15))
+                if is_late_game_for_buff:
+                    danger_threshold_local = float(self._global_cfg("late_danger_threshold", 0.25))
+
+                in_danger_for_buff = bool(cur_min_monster_dist_norm < danger_threshold_local)
+                danger_block = disable_when_in_danger and in_danger_for_buff
+
+                treasure_block = disable_when_treasure_gain and (treasure_delta > 0)
+                cur_had_speed_buff_for_buff = float(hero.get("buff_remaining_time", 0)) > 0
+                # 条件：当前持有buff + 场上有buff目标 + 本步继续靠近buff
+                if (
+                    (not danger_block)
+                    and (not treasure_block)
+                    and cur_had_speed_buff_for_buff
+                    and cur_speed_buff_found
+                    and (cur_min_speed_buff_dist_norm < (self.last_min_speed_buff_dist_norm - delta_eps))
+                ):
+                    dist_gain = float(self.last_min_speed_buff_dist_norm - cur_min_speed_buff_dist_norm)
+                    buff_opportunity_cost_penalty = float(
+                        self._cfg("buff_opportunity_cost_penalty", "coef", -0.06)
+                    ) * dist_gain
 
         # 5. 【稠密】宝箱接近奖励（平方反比引力）—— 只对最近宝箱计算，接近时触发
         treasure_approach_reward = 0.0
@@ -2560,22 +2658,67 @@ class Preprocessor:
                 flash_fail_penalty = float(self._cfg("flash_fail_penalty", "coef", -0.15))
                 flash_fail_triggered = True
 
-        # 10.5 【稀疏/轻惩罚】该闪未闪惩罚
-        # 条件：处于危险窗口 + 闪现CD就绪 + 本步未闪现
+        # 10.25 【稀疏】闪现穿墙奖励：本步使用闪现且路径穿过障碍时给奖励
+        flash_through_wall_reward = 0.0
+        if self._cfg("flash_through_wall_reward", "enable", True):
+            if cur_used_flash and self.last_hero_pos is not None:
+                # 用“实际位移线段”判定是否穿墙（与mask阶段的几何判定一致）
+                crossed_wall = self._sample_line_has_block(
+                    float(self.last_hero_pos["x"]),
+                    float(self.last_hero_pos["z"]),
+                    float(hero_pos["x"]),
+                    float(hero_pos["z"]),
+                    map_info,
+                )
+
+                if crossed_wall:
+                    flash_through_wall_reward = float(self._cfg("flash_through_wall_reward", "coef", 50))
+
+                
+
+        # 10.5 【危险窗口两段式】该闪不闪惩罚（不扩大危险半径）
+        # A. 入圈瞬时惩罚：刚进入危险圈且可闪但不闪，立即重罚
+        # B. 圈内持续惩罚：连续不闪，惩罚递增并封顶
+        # C. 圈内不闪且未拉开距离：附加小惩罚
         flash_hold_penalty = 0.0
+        in_danger_now = bool(danger_penalty < 0)  # 仍沿用当前危险半径定义
+
         if self._cfg("flash_hold_penalty", "enable", True):
-            # 训练期控制：eval 不施加，避免污染评估
             if (not bool(self._cfg("flash_hold_penalty", "apply_only_train", True))) or (self.episode_mode != "eval"):
                 flash_ready = bool(hero.get("flash_cooldown", 1) <= 0) if bool(
                     self._cfg("flash_hold_penalty", "require_flash_ready", True)
                 ) else True
 
-                # 用你已有危险判据：danger_penalty < 0 等价“已进入危险阈值”
-                in_danger_now = bool(danger_penalty < 0)
+                should_flash_now = bool(in_danger_now and flash_ready and (not cur_used_flash))
 
-                if in_danger_now and flash_ready and (not cur_used_flash):
-                    flash_hold_penalty = float(self._cfg("flash_hold_penalty", "coef", -0.03))
+                if should_flash_now:
+                    # A) 入圈瞬时惩罚
+                    if not bool(getattr(self, "prev_in_danger", False)):
+                        flash_hold_penalty += float(self._cfg("flash_hold_penalty", "entry_coef", -0.16))
 
+                    # B) 圈内持续惩罚（递增+封顶）
+                    self.danger_hold_steps = int(getattr(self, "danger_hold_steps", 0)) + 1
+                    hold_base = float(self._cfg("flash_hold_penalty", "hold_base_coef", -0.02))
+                    hold_growth = float(self._cfg("flash_hold_penalty", "hold_growth", 0.25))
+                    hold_max_abs = float(self._cfg("flash_hold_penalty", "hold_max_abs", 0.08))
+
+                    hold_scale = 1.0 + hold_growth * max(0, self.danger_hold_steps - 1)
+                    hold_pen = hold_base * hold_scale
+                    # 负值封顶到 [-hold_max_abs, 0]
+                    hold_pen = max(-abs(hold_max_abs), min(0.0, hold_pen))
+                    flash_hold_penalty += hold_pen
+
+                    # C) 未改善危险（没拉开距离）附加惩罚
+                    if monster_dist_delta_raw <= 0.0:
+                        flash_hold_penalty += float(
+                            self._cfg("flash_hold_penalty", "no_improve_extra_coef", -0.02)
+                        )
+                else:
+                    self.danger_hold_steps = 0
+
+        # 更新危险窗口状态（供下一步判定“入圈”）
+        self.prev_in_danger = bool(in_danger_now)
+        
         # 记录上一决策动作与执行结果，用于分析合法动作掩码是否有效。
         no_movement_case = 0.0
         move_mask_consistency_hit = 0.0
@@ -2772,54 +2915,32 @@ class Preprocessor:
             else:
                 self.wander_streak_steps = 0
 
-        # 17.【稀疏】闪现滥用惩罚
-        #     1) 闪现后10步内被抓 -1
-        #     2) 在安全区闪现且未拿到宝箱 -1
+        # 17.【行为型】闪现滥用惩罚（不乱闪）
+        # - 非危险状态闪现：直接惩罚
+        # - 安全区闪现且无宝箱收益：额外惩罚
         flash_abuse_penalty = 0.0
-        flash_abuse_penalty_caught = 0.0
+        flash_abuse_penalty_caught = 0.0  # 保留字段兼容日志
         flash_abuse_penalty_safe_zone = 0.0
+        flash_abuse_penalty_non_danger = 0.0
+
         if self._cfg("flash_abuse_penalty", "enable", True):
-            # 安全区无收益闪现惩罚（当步）
-            if cur_used_flash and is_in_safe_zone and treasure_delta <= 0:
-                flash_abuse_penalty_safe_zone += float(
-                    self._cfg("flash_abuse_penalty", "safe_zone_no_treasure_coef", -1.0)
+            in_danger_now = bool(danger_penalty < 0)
+
+            if cur_used_flash and (not in_danger_now):
+                flash_abuse_penalty_non_danger += float(
+                    self._cfg("flash_abuse_penalty", "non_danger_flash_coef", -1)
                 )
-                self.flash_success_blocked = True
-                self.flash_escape_active = False
-                self.flash_survival_decay = 0.0
 
-            # 闪现后N步内被抓惩罚
-            if self.flash_recent_steps is not None:
-                caught_window = int(self._cfg("flash_abuse_penalty", "caught_within_steps", 10))
-                if bool(terminated and (not truncated)) and self.flash_recent_steps <= caught_window:
-                    decay_enable = bool(self._cfg("flash_abuse_penalty", "caught_decay_enable", True))
-                    if decay_enable:
-                        decay_min_step = int(self._cfg("flash_abuse_penalty", "caught_decay_min_step", 1))
-                        decay_max_step = int(self._cfg("flash_abuse_penalty", "caught_decay_max_step", 15))
-                        coef_start = float(self._cfg("flash_abuse_penalty", "caught_coef_start", -10.0))
-                        coef_end = float(self._cfg("flash_abuse_penalty", "caught_coef_end", -1.0))
+            # if cur_used_flash and is_in_safe_zone and treasure_delta <= 0:
+            #     flash_abuse_penalty_safe_zone += float(
+            #         self._cfg("flash_abuse_penalty", "safe_zone_no_treasure_coef", -0.10)
+            #     )
 
-                        s = max(1, int(self.flash_recent_steps))
-                        if s <= decay_min_step:
-                            caught_coef = coef_start
-                        elif s >= decay_max_step:
-                            caught_coef = coef_end
-                        else:
-                            t = float(s - decay_min_step) / float(max(1, decay_max_step - decay_min_step))
-                            caught_coef = coef_start + (coef_end - coef_start) * t
-                        flash_abuse_penalty_caught += caught_coef
-                    else:
-                        flash_abuse_penalty_caught += float(self._cfg("flash_abuse_penalty", "caught_coef", -1.0))
-                    self.flash_success_blocked = True
-                    self.flash_escape_active = False
-                    self.flash_survival_decay = 0.0
-                    self.flash_recent_steps = None
-                else:
-                    self.flash_recent_steps += 1
-                    if self.flash_recent_steps > caught_window:
-                        self.flash_recent_steps = None
-
-        flash_abuse_penalty = flash_abuse_penalty_caught + flash_abuse_penalty_safe_zone
+        flash_abuse_penalty = (
+            flash_abuse_penalty_caught
+            + flash_abuse_penalty_safe_zone
+            + flash_abuse_penalty_non_danger
+        )
 
         # 18.【稠密】死角/死路惩罚（进入后每步惩罚，远离后停止）
         dead_end_penalty = 0.0
@@ -2867,6 +2988,7 @@ class Preprocessor:
             treasure_reward +
             speed_buff_reward +
             buff_overlap_penalty +
+            buff_opportunity_cost_penalty +
             speed_buff_approach_reward +
             treasure_approach_reward +
             monster_dist_shaping +
@@ -2874,6 +2996,7 @@ class Preprocessor:
             danger_penalty +
             wall_collision_penalty +
             flash_fail_penalty +
+            flash_through_wall_reward +
             flash_escape_reward +
             flash_survival_reward +
             speed_buff_escape_reward +
@@ -2938,6 +3061,7 @@ class Preprocessor:
             "speed_buff_reward": speed_buff_reward,
             "buff_overlap_penalty": buff_overlap_penalty,
             "speed_buff_approach_reward": speed_buff_approach_reward,
+            "buff_opportunity_cost_penalty": buff_opportunity_cost_penalty,
             "treasure_approach_reward": treasure_approach_reward,
             "treasure_memory_slots": float(len(treasure_dist_norms)),
             "speed_buff_memory_slots": float(len(speed_buff_dist_norms)),
@@ -2964,6 +3088,7 @@ class Preprocessor:
             "flash_fail_penalty": flash_fail_penalty,
             "flash_escape_reward": flash_escape_reward,
             "flash_survival_reward": flash_survival_reward,
+            "flash_through_wall_reward": flash_through_wall_reward,
             "flash_escape_active": float(self.flash_escape_active),
             "flash_escape_steps": float(self.flash_escape_steps),
             "flash_escape_window_steps": float(self.flash_escape_window_steps),
@@ -2979,6 +3104,8 @@ class Preprocessor:
             "flash_abuse_penalty": flash_abuse_penalty,
             "flash_abuse_penalty_caught": flash_abuse_penalty_caught,
             "flash_abuse_penalty_safe_zone": flash_abuse_penalty_safe_zone,
+            "flash_abuse_penalty_non_danger": flash_abuse_penalty_non_danger,
+            "danger_hold_steps": float(getattr(self, "danger_hold_steps", 0)),
             "dead_end_penalty": dead_end_penalty,
             "dead_end_active": float(self.dead_end_active),
             "no_movement_case": no_movement_case,
