@@ -126,7 +126,13 @@ class EpisodeRunner:
             "buff_opportunity_cost_penalty": 0.0,
             "flash_abuse_penalty_non_danger": 0.0,
             "danger_hold_steps": 0.0,
-            "flash_through_wall_reward":0.0
+            "flash_through_wall_reward":0.0,
+            "dead_end_flash_attempt_count": 0.0,
+            "dead_end_flash_back_success_count": 0.0,
+            "dead_end_flash_back_reward": 0.0,
+            "dead_end_escape_after_flash_rate": 0.0,
+            "dead_end_flash_post_dist_gain_mean": 0.0,
+            "flash_through_wall_route_gain_steps": 0.0,
         }
         # 开图率相关：使用“最后一步值”而不是累加
         self.explore_rate = 0.0
@@ -167,6 +173,14 @@ class EpisodeRunner:
         data["treasure_circle_enter_total"] = round(self.treasure_circle_enter_total, 4)
         data["treasure_circle_hit_total"] = round(self.treasure_circle_hit_total, 4)
         data["treasure_circle_hit_rate"] = round(self.treasure_circle_hit_rate, 4)
+        attempt = float(self.reward_components.get("dead_end_flash_attempt_count", 0.0))
+        success = float(self.reward_components.get("dead_end_flash_back_success_count", 0.0))
+        sum_escape = float(self.reward_components.get("dead_end_escape_after_flash_rate", 0.0))
+        sum_gain = float(self.reward_components.get("dead_end_flash_post_dist_gain_mean", 0.0))
+
+        data["dead_end_flash_back_success_rate"] = round((success / attempt) if attempt > 1e-6 else 0.0, 4)
+        data["dead_end_escape_after_flash_rate"] = round((sum_escape / attempt) if attempt > 1e-6 else 0.0, 4)
+        data["dead_end_flash_post_dist_gain_mean"] = round((sum_gain / attempt) if attempt > 1e-6 else 0.0, 6)
         return data
 
     def _is_eval_episode(self):

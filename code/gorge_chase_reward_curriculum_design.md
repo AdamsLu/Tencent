@@ -441,7 +441,7 @@
 
 | 指标 | 当前 | 建议 |
 |---|---:|---:|
-| avg_survival_rate | 0.52 | **0.50** |
+| avg_survival_rate | 0.52 | **0.36** |
 | min_treasure_count | 0.30 | **0.55** |
 | min_buff_count | 0.08 | **0.15** |
 | min_treasure_approach_reward | 0.01 | **0.015** |

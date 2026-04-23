@@ -159,4 +159,14 @@ second_visit = 0.1
 
 [reward.flash_through_wall_reward]
 enable = true
-coef = 50
+base = 30.0
+per_route_step = 2.0
+max_per_step = 200.0
+
+[reward.dead_end_flash_back_reward]
+enable = true
+base = 40
+dist_gain_coef = 8.0
+exit_dead_end_bonus = 20
+behind_cos_threshold = 0.5
+max_per_step = 100

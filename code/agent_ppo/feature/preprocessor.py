@@ -1231,8 +1231,32 @@ class Preprocessor:
                     remaining.remove(item)
                     stack.append(item)
 
-        # ===== 4) 局部BFS紧凑度 =====
-        dirs4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        # ===== 4) 局部BFS紧凑度（8邻接，且与移动切角规则一致） =====
+        allow_corner_cut = bool(getattr(self, "ALLOW_CORNER_CUT_MOVE", True))
+        dirs8 = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        ]
+
+        def bfs_step_passable(r, c, nr, nc):
+            # 目标格必须可通行
+            if not passable(nr, nc):
+                return False
+
+            dr, dc = nr - r, nc - c
+            # 直移
+            if dr == 0 or dc == 0:
+                return True
+
+            # 斜移切角规则（与动作mask一致）
+            side1 = passable(r + dr, c)   # 竖向邻格
+            side2 = passable(r, c + dc)   # 横向邻格
+            if allow_corner_cut:
+                # 允许切角：至少一侧可通
+                return side1 or side2
+            # 不允许切角：两侧都可通
+            return side1 and side2
+
         visited = set()
         q = deque()
         q.append((cr, cc))
@@ -1240,16 +1264,19 @@ class Preprocessor:
 
         while q:
             r, c = q.popleft()
-            for dr, dc in dirs4:
+            for dr, dc in dirs8:
                 nr, nc = r + dr, c + dc
-                if not passable(nr, nc):
-                    continue
 
                 bubble_dist = max(abs(nr - cr), abs(nc - cc))
-                if bubble_dist <= max_radius:
-                    if (nr, nc) not in visited:
-                        visited.add((nr, nc))
-                        q.append((nr, nc))
+                if bubble_dist > max_radius:
+                    continue
+
+                if (nr, nc) in visited:
+                    continue
+
+                if bfs_step_passable(r, c, nr, nc):
+                    visited.add((nr, nc))
+                    q.append((nr, nc))
 
         reachable_cells = len(visited)
         bubble_area = float((2 * max_radius + 1) * (2 * max_radius + 1))
@@ -1485,6 +1512,61 @@ class Preprocessor:
         )
         return dx, dz, expected_dist
 
+    # ===== 新增辅助函数：几何与奖励统计 =====
+
+    def _vec_len(self, dx, dz):
+        return float(np.sqrt(dx * dx + dz * dz))
+
+    def _is_flash_action(self, act_idx):
+        try:
+            a = int(act_idx)
+        except Exception:
+            return False
+        return 8 <= a <= 15
+
+    def _get_nearest_active_monster(self, monsters, hero_pos):
+        hx = int(hero_pos.get("x", 0))
+        hz = int(hero_pos.get("z", 0))
+        best = None
+        best_d = 1e9
+        for m in monsters or []:
+            if not isinstance(m, dict):
+                continue
+            pos = m.get("pos", {})
+            if not isinstance(pos, dict):
+                continue
+            mx = int(pos.get("x", 0))
+            mz = int(pos.get("z", 0))
+            if mx == 0 and mz == 0:
+                continue
+            d = self._vec_len(mx - hx, mz - hz)
+            if d < best_d:
+                best_d = d
+                best = m
+        return best, best_d
+
+    def _flash_landing_is_behind_monster(self, hero_pos, monster_pos, landing_pos, cos_threshold=0.5):
+        """
+        判定“闪现落点是否在怪物身后扇区”：
+        v_hm = monster - hero
+        v_ml = landing - monster
+        cos(v_hm, v_ml) > cos_threshold 视为在怪物后方（默认约60度扇区）
+        """
+        hx, hz = float(hero_pos["x"]), float(hero_pos["z"])
+        mx, mz = float(monster_pos["x"]), float(monster_pos["z"])
+        lx, lz = float(landing_pos["x"]), float(landing_pos["z"])
+
+        v1x, v1z = mx - hx, mz - hz
+        v2x, v2z = lx - mx, lz - mz
+
+        n1 = self._vec_len(v1x, v1z)
+        n2 = self._vec_len(v2x, v2z)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return False
+
+        cosv = (v1x * v2x + v1z * v2z) / (n1 * n2)
+        return cosv >= float(cos_threshold)
+
     def _sample_line_has_block(self, x0, z0, x1, z1, map_info):
         """Check whether segment from start to end crosses blocked cells in local map projection."""
         if map_info is None:
@@ -1515,6 +1597,23 @@ class Preprocessor:
             if is_block(gx, gz):
                 return True
         return False
+
+    def _estimate_grid_path_steps_8dir(self, start_pos, end_pos, map_info):
+        """
+        估计两点在网格上的8邻接最短步数（允许未知按可走处理与否由 _astar 决定）。
+        失败返回None。
+        """
+        try:
+            sx = int(start_pos.get("x", 0))
+            sz = int(start_pos.get("z", 0))
+            ex = int(end_pos.get("x", 0))
+            ez = int(end_pos.get("z", 0))
+            d = self._astar_path_distance_8dir((sx, sz), (ex, ez), allow_unknown=True, max_expand=4000)
+            if d is None:
+                return None
+            return float(d)
+        except Exception:
+            return None
 
     def _is_flash_target_passable(self, tx, tz, hero_pos, map_info):
         """Check flash target passability by local map projection."""
@@ -2340,6 +2439,8 @@ class Preprocessor:
             total_reward (float): 总即时奖励
             reward_info (dict): 各奖励分量的详细信息（用于调试/监控）
         """
+        reward = 0.0
+        reward_info = {}
 
         # ========== 提取当前帧关键信息 ==========
         hero = frame_state["heroes"]
@@ -2426,6 +2527,16 @@ class Preprocessor:
                 (hero_pos["x"] - self.last_hero_pos["x"]) ** 2
                 + (hero_pos["z"] - self.last_hero_pos["z"]) ** 2
             )
+
+        # 动作解析
+        action_idx = -1
+        try:
+            if isinstance(last_action, (list, tuple, np.ndarray)) and len(last_action) > 0:
+                action_idx = int(last_action[0])
+            else:
+                action_idx = int(last_action)
+        except Exception:
+            action_idx = -1
 
         # ========== 开始计算各奖励分量 ==========
 
@@ -2658,23 +2769,98 @@ class Preprocessor:
                 flash_fail_penalty = float(self._cfg("flash_fail_penalty", "coef", -0.15))
                 flash_fail_triggered = True
 
-        # 10.25 【稀疏】闪现穿墙奖励：本步使用闪现且路径穿过障碍时给奖励
+        # 10.25 【稀疏】闪现穿墙奖励：本步使用闪现且路径穿过障碍时给奖励（基础30 + 沿路增益每步2）
         flash_through_wall_reward = 0.0
-        if self._cfg("flash_through_wall_reward", "enable", True):
-            if cur_used_flash and self.last_hero_pos is not None:
-                # 用“实际位移线段”判定是否穿墙（与mask阶段的几何判定一致）
-                crossed_wall = self._sample_line_has_block(
-                    float(self.last_hero_pos["x"]),
-                    float(self.last_hero_pos["z"]),
-                    float(hero_pos["x"]),
-                    float(hero_pos["z"]),
-                    map_info,
+        flash_through_wall_route_gain_steps = 0.0
+
+        if 8 <= action_idx <= 15 and bool(self._cfg("flash_through_wall_reward", "enable", True)):
+            flash_idx = action_idx - 8
+            landing = self._find_flash_landing_from_far_to_near(hero_pos, flash_idx, map_info)
+
+            through_wall = False
+            if isinstance(landing, dict) and "x" in landing and "z" in landing:
+                through_wall = self._sample_line_has_block(
+                    int(hero_pos["x"]), int(hero_pos["z"]),
+                    int(landing["x"]), int(landing["z"]),
+                    map_info
                 )
 
-                if crossed_wall:
-                    flash_through_wall_reward = float(self._cfg("flash_through_wall_reward", "coef", 50))
+            if through_wall and isinstance(landing, dict):
+                nearest_m, _ = self._get_nearest_active_monster(monsters_raw, hero_pos)
+                if nearest_m is not None and isinstance(nearest_m.get("pos", {}), dict):
+                    mpos = nearest_m["pos"]
 
-                
+                    pre_steps = self._estimate_grid_path_steps_8dir(hero_pos, mpos, map_info)
+                    post_steps = self._estimate_grid_path_steps_8dir(landing, mpos, map_info)
+
+                    route_gain_steps = 0.0
+                    if (pre_steps is not None) and (post_steps is not None):
+                        route_gain_steps = max(0.0, float(post_steps - pre_steps))
+
+                    base_reward = float(self._cfg("flash_through_wall_reward", "base", 30.0))
+                    per_step_reward = float(self._cfg("flash_through_wall_reward", "per_route_step", 2.0))
+                    max_reward = float(self._cfg("flash_through_wall_reward", "max_per_step", 200.0))
+
+                    shaped = base_reward + per_step_reward * route_gain_steps
+                    shaped = float(np.clip(shaped, 0.0, max_reward))
+
+                    flash_through_wall_reward += shaped
+                    flash_through_wall_route_gain_steps += route_gain_steps
+
+        # 10.30 【稀疏】死角闪现绕后奖励：死角受压时，闪到怪物身后给基础40；若摆脱死角额外+20
+        dead_end_flash_attempt_count = 0.0
+        dead_end_flash_back_success_count = 0.0
+        dead_end_flash_back_success_rate = 0.0
+        dead_end_flash_back_reward = 0.0
+        dead_end_escape_after_flash_rate = 0.0
+        dead_end_flash_post_dist_gain_mean = 0.0
+
+        if bool(self._cfg("dead_end_flash_back_reward", "enable", True)) and self._is_flash_action(action_idx):
+            in_dead_end = self._is_half_surrounded_dead_end(map_info)
+            nearest_m, _ = self._get_nearest_active_monster(monsters_raw, hero_pos)
+
+            if in_dead_end and nearest_m is not None:
+                danger_th = float(self._global_cfg("danger_threshold", 0.15))
+                mpos = nearest_m.get("pos", {})
+                pre_dist = self._vec_len(float(mpos["x"]) - float(hero_pos["x"]), float(mpos["z"]) - float(hero_pos["z"]))
+                pre_dist_norm = pre_dist / MAP_DIAGONAL if pre_dist < 1e8 else 1.0
+                is_under_pressure = pre_dist_norm <= (danger_th + 0.03)
+
+                if is_under_pressure:
+                    dead_end_flash_attempt_count = 1.0
+                    flash_idx = action_idx - 8
+                    landing = self._find_flash_landing_from_far_to_near(hero_pos, flash_idx, map_info)
+
+                    if isinstance(landing, dict) and "x" in landing and "z" in landing:
+                        behind = self._flash_landing_is_behind_monster(
+                            hero_pos=hero_pos,
+                            monster_pos=mpos,
+                            landing_pos=landing,
+                            cos_threshold=float(self._cfg("dead_end_flash_back_reward", "behind_cos_threshold", 0.5)),
+                        )
+
+                        if behind:
+                            base = float(self._cfg("dead_end_flash_back_reward", "base", 40.0))
+                            exit_bonus = float(self._cfg("dead_end_flash_back_reward", "exit_dead_end_bonus", 20.0))
+                            dist_gain_coef = float(self._cfg("dead_end_flash_back_reward", "dist_gain_coef", 0.0))
+                            max_per_step = float(self._cfg("dead_end_flash_back_reward", "max_per_step", 120.0))
+
+                            post_dist = self._vec_len(float(mpos["x"]) - float(landing["x"]), float(mpos["z"]) - float(landing["z"]))
+                            dist_gain_norm = max(0.0, (post_dist - pre_dist) / MAP_DIAGONAL)
+
+                            move_dist = self._vec_len(float(landing["x"]) - float(hero_pos["x"]), float(landing["z"]) - float(hero_pos["z"]))
+                            escaped = 1.0 if move_dist >= float(self._global_cfg("dead_end_reset_distance", 8.0)) * 0.5 else 0.0
+
+                            shaped = base + exit_bonus * escaped + dist_gain_coef * dist_gain_norm
+                            shaped = float(np.clip(shaped, 0.0, max_per_step))
+
+                            dead_end_flash_back_success_count = 1.0
+                            dead_end_flash_back_reward += shaped
+                            dead_end_escape_after_flash_rate = escaped
+                            dead_end_flash_post_dist_gain_mean = dist_gain_norm
+
+        if dead_end_flash_attempt_count > 0:
+            dead_end_flash_back_success_rate = dead_end_flash_back_success_count / dead_end_flash_attempt_count
 
         # 10.5 【危险窗口两段式】该闪不闪惩罚（不扩大危险半径）
         # A. 入圈瞬时惩罚：刚进入危险圈且可闪但不闪，立即重罚
@@ -2984,31 +3170,32 @@ class Preprocessor:
 
         # ========== 汇总所有奖励分量 ==========
         total_reward = (
-            survive_reward +
-            treasure_reward +
-            speed_buff_reward +
-            buff_overlap_penalty +
-            buff_opportunity_cost_penalty +
-            speed_buff_approach_reward +
-            treasure_approach_reward +
-            monster_dist_shaping +
-            late_survive_reward +
-            danger_penalty +
-            wall_collision_penalty +
-            flash_fail_penalty +
-            flash_through_wall_reward +
-            flash_escape_reward +
-            flash_survival_reward +
-            speed_buff_escape_reward +
-            safe_zone_reward +
-            flash_abuse_penalty +
-            dead_end_penalty +
-            exploration_reward +
-            visit_tracking_reward +
-            centroid_away_reward +
-            idle_wander_penalty +
-            flash_hold_penalty
-        )
+			survive_reward +
+			treasure_reward +
+			speed_buff_reward +
+			buff_overlap_penalty +
+			buff_opportunity_cost_penalty +
+			speed_buff_approach_reward +
+			treasure_approach_reward +
+			monster_dist_shaping +
+			late_survive_reward +
+			danger_penalty +
+			wall_collision_penalty +
+			flash_fail_penalty +
+			flash_through_wall_reward +
+			dead_end_flash_back_reward +
+			flash_escape_reward +
+			flash_survival_reward +
+			speed_buff_escape_reward +
+			safe_zone_reward +
+			flash_abuse_penalty +
+			dead_end_penalty +
+			exploration_reward +
+			visit_tracking_reward +
+			centroid_away_reward +
+			idle_wander_penalty +
+			flash_hold_penalty
+		)
         # ====== 训练样本重加权（reward-scale 等效）======
         sample_weight = 1.0
         if bool(self._global_cfg("flash_sample_reweight_enable", True)):

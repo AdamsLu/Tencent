@@ -74,7 +74,14 @@ def build_monitor():
         ("buff浪费惩罚","buff_opportunity_cost_penalty"),
         ("无危险滥用闪现惩罚","flash_abuse_penalty_non_danger"),
         ("危险区滞留步数","danger_hold_steps"),
-        ("闪现穿墙奖励","flash_through_wall_reward")
+        ("闪现穿墙奖励","flash_through_wall_reward"),
+        ("死角受压闪现尝试次数", "dead_end_flash_attempt_count"),
+        ("死角受压闪现绕后成功次数", "dead_end_flash_back_success_count"),
+        ("死角受压闪现绕后成功率", "dead_end_flash_back_success_rate"),
+        ("死角受压闪现绕后奖励", "dead_end_flash_back_reward"),
+        ("死角闪现后脱离率", "dead_end_escape_after_flash_rate"),
+        ("死角闪现后怪物距离增益均值", "dead_end_flash_post_dist_gain_mean"),
+        ("闪现穿墙沿路增益步数", "flash_through_wall_route_gain_steps"),
     ]
     for panel_name, metric_name in reward_panels:
         monitor.add_panel(name=panel_name, name_en=metric_name, type="line")
